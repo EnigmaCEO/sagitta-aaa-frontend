@@ -1,0 +1,23 @@
+.perfInput {
+  background-color: #2b2b2b; /* dark gray, non-transparent */
+  border: 1px solid #666666; /* medium gray border */
+  color: #ffffff; /* readable text color */
+  padding: 6px; /* at least 6px padding */
+  border-radius: 5px; /* 4-6px radius */
+  width: 160px; /* reasonable width between 140-200px */
+  box-sizing: border-box;
+  outline: none;
+  font-size: 14px;
+}
+
+/* placeholder color (readable light gray) */
+.perfInput::placeholder {
+  color: #bfbfbf;
+  opacity: 1;
+}
+
+/* focus outline / glow (blue) */
+.perfInput:focus {
+  border-color: #1e90ff;
+  box-shadow: 0 0 0 4px rgba(30, 144, 255, 0.18);
+}
