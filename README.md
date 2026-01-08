@@ -1,6 +1,6 @@
-# Sagitta AAA Frontend (MVP)
+# Sagitta Autonomous Allocation Agent Frontend (MVP)
 
-Sagitta AAA Frontend is the UI for running **allocation ticks**, editing **portfolio / constraints / regime**, and visualizing results in two modes:
+Sagitta Autonomous Allocation Agent (AAA) Frontend is the UI for running **allocation ticks**, editing **portfolio / constraints / regime**, and visualizing results in two modes:
 
 - **Protocol Mode**: Weekly inflows → AAA computes the _next allocation plan_. Existing holdings are never rebalanced; each tick represents an atomic allocation window.
 - **Simulation Mode**: A sandbox to run multi-year (e.g. 10-year) A/B simulations, step year-by-year, and compare baseline vs AAA outcomes.
