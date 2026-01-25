@@ -1,11 +1,13 @@
 "use client";
 
 import React, { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import Image from "next/image";
 import {
   createScenario,
   getScenario,
   putPortfolio,
   putConstraints,
+  putAllocatorVersion,
   putInflow,
   runTick,
   getTicks,
@@ -19,6 +21,8 @@ import {
   simStep,
   simRun,
   putRegime,
+  explainTick,
+  previewPortfolioImport,
 } from "../../lib/api";
 
 import { useDebouncedAutosave } from "../../lib/hooks";
@@ -30,6 +34,14 @@ import {
   sanitizeNumber,
   sanitizeSelect,
 } from "../../lib/regimeSchema";
+import type { ImportPreviewResult } from "../../lib/imports/types";
+import { applyPriors } from "../../lib/imports/riskClassPriors";
+import {
+  buildPolicyImpactDetails,
+  resolveAllocatorVersion,
+  resolveAnalyzerVersion,
+  resolvePolicyRef,
+} from "../../lib/policyImpact";
 
 function iso(v?: string | undefined): string {
   try {
@@ -127,6 +139,9 @@ type RiskClass =
   | "stablecoin"
   | "large_cap_crypto"
   | "defi_bluechip"
+  | "large_cap_equity_core"
+  | "defensive_equity"
+  | "growth_high_beta_equity"
   | "high_risk"
   | "equity_fund"
   | "fixed_income"
@@ -145,6 +160,8 @@ type RiskClass =
   | "fund_of_funds"
   | "index_fund";
 
+type AssetRole = "core" | "satellite" | "defensive" | "liquidity" | "carry" | "speculative";
+
 interface Asset {
   id: string;
   name: string;
@@ -152,6 +169,7 @@ interface Asset {
   expected_return: number;
   volatility: number;
   risk_class?: RiskClass;
+  role?: AssetRole;
   max_annual_loss?: number;
   max_annual_gain?: number;
   [key: string]: unknown;
@@ -170,6 +188,89 @@ interface Constraints {
   [key: string]: unknown;
 }
 
+const CONSTRAINT_DEFAULTS: Constraints = {
+  min_asset_weight: 0.05,
+  max_asset_weight: 0.6,
+  max_concentration: 0.7,
+};
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
+function remainingPortfolioWeight(assets: Asset[], excludeIdx: number): number {
+  const sum = assets.reduce((acc, asset, idx) => {
+    if (idx === excludeIdx) return acc;
+    const w = typeof asset.current_weight === "number" && Number.isFinite(asset.current_weight) ? asset.current_weight : 0;
+    return acc + Math.max(0, w);
+  }, 0);
+  return Math.max(0, 1 - sum);
+}
+
+function clampWeightToRemaining(value: number, remaining: number): number {
+  const clamped = clamp01(value);
+  const cap = Math.max(0, Math.min(1, remaining));
+  return Math.min(clamped, cap);
+}
+
+function applyConstraintDefaults(base?: Constraints | null): Constraints {
+  let minVal =
+    typeof base?.min_asset_weight === "number" && Number.isFinite(base.min_asset_weight)
+      ? base.min_asset_weight
+      : CONSTRAINT_DEFAULTS.min_asset_weight;
+  let maxVal =
+    typeof base?.max_asset_weight === "number" && Number.isFinite(base.max_asset_weight)
+      ? base.max_asset_weight
+      : CONSTRAINT_DEFAULTS.max_asset_weight;
+  let concVal =
+    typeof base?.max_concentration === "number" && Number.isFinite(base.max_concentration)
+      ? base.max_concentration
+      : CONSTRAINT_DEFAULTS.max_concentration;
+
+  minVal = clamp01(minVal!);
+  maxVal = clamp01(maxVal!);
+  concVal = clamp01(concVal!);
+
+  if (maxVal < minVal) maxVal = minVal;
+  if (concVal < maxVal) concVal = maxVal;
+
+  return {
+    min_asset_weight: minVal,
+    max_asset_weight: maxVal,
+    max_concentration: concVal,
+  };
+}
+
+function normalizeConstraintsAfterEdit(
+  draft: Constraints | null,
+  key: keyof Constraints,
+  rawValue: number
+): Constraints {
+  const base = applyConstraintDefaults(draft);
+  let minVal = base.min_asset_weight ?? CONSTRAINT_DEFAULTS.min_asset_weight;
+  let maxVal = base.max_asset_weight ?? CONSTRAINT_DEFAULTS.max_asset_weight;
+  let concVal = base.max_concentration ?? CONSTRAINT_DEFAULTS.max_concentration;
+  const nextVal = clamp01(rawValue);
+
+  if (key === "min_asset_weight") {
+    const ceiling = Math.min(maxVal!, concVal!);
+    minVal = Math.min(nextVal, ceiling);
+  } else if (key === "max_asset_weight") {
+    const floor = minVal;
+    const ceiling = concVal;
+    maxVal = Math.max(floor!, Math.min(nextVal, ceiling!));
+  } else if (key === "max_concentration") {
+    const floor = maxVal;
+    concVal = Math.max(floor!, Math.min(nextVal, 1));
+  }
+
+  return {
+    min_asset_weight: minVal,
+    max_asset_weight: maxVal,
+    max_concentration: concVal,
+  };
+}
+
 interface TickMeta {
   plan_id?: string;
   decision_window_start?: string;
@@ -180,10 +281,20 @@ interface TickMeta {
 interface Tick {
   tick_id: string;
   timestamp: string;
+  allocator_version?: string;
+  policy_id?: string;
+  policy_name?: string;
+  analysis_meta?: {
+    allocator_version?: string;
+    analyzer_version?: string | null;
+    policy_id?: string;
+    policy_name?: string;
+  };
   meta?: TickMeta;
   reason_codes?: unknown;
   next_allocation_plan?: { allocations_usd?: unknown } | null;
   risk_metrics?: unknown;
+  policy_snapshot?: Record<string, unknown>;
   narrative?: {
     summary?: string;
     rationale_bullets?: string[];
@@ -199,6 +310,99 @@ interface Tick {
     regime_impact?: string;
     fees_impact?: string;
     confidence?: string;
+    meta?: {
+      enabled?: boolean;
+      model?: string;
+      error?: string;
+      status?: string;
+    };
+  };
+  pruning_summary?: {
+    pruned_assets?: string[];
+    pruned_count?: number;
+    [key: string]: unknown;
+  };
+  role_by_asset?: Record<string, string>;
+  role_policy?: Record<string, unknown> | null;
+  role_effects?: {
+    enabled?: boolean;
+    dominance_gap?: number;
+    rule?: string;
+    status?: string;
+    before?: { core_max_weight?: number; non_core_max_weight?: number };
+    after?: { core_max_weight?: number; non_core_max_weight?: number };
+    transfers?: Array<{ from?: string; to?: string; amount?: number }>;
+    blockers?: string[];
+    allocator_version?: string;
+  };
+  per_asset_score_trace?: Record<
+    string,
+    {
+      base_score?: number | null;
+      role_delta?: number | null;
+      posture_delta?: number | null;
+      final_score?: number | null;
+    }
+  >;
+  pruning_trace?: Record<
+    string,
+    {
+      pruned?: boolean;
+      reason?: string | null;
+      role_override_applied?: boolean;
+    }
+  >;
+  role_constraints_summary?: string[];
+  policy_effects?: {
+    allocator_version?: string | null;
+    mission?: string | null;
+    risk_posture?: string | null;
+    confidence_level?: string | null;
+    liquidity_state?: string | null;
+    correlation_state?: string | null;
+    applied_effects?: {
+      expected_return_multiplier?: number;
+      volatility_multiplier?: number;
+      correlation_penalty_applied?: boolean;
+      liquidity_penalty_applied?: boolean;
+      risk_budget_multiplier?: number;
+    };
+    notes?: string[];
+    [key: string]: unknown;
+  };
+  policy_sensitivity?: {
+    equivalent?: boolean;
+    binding_factors?: string[];
+    inactive_factors?: string[];
+    ranking_changed?: boolean;
+    pruning_changed?: boolean;
+    constraint_binding_changed?: boolean;
+    normalization_dominated?: boolean;
+    weight_delta_l1_vs_baseline?: number;
+    max_weight_delta_vs_baseline?: number;
+    divergence_conditions?: string[];
+    equivalence_class?: string;
+    [key: string]: unknown;
+  };
+  policy_equivalence?: {
+    equivalent?: boolean;
+    reason?: string | null;
+    compared_policies?: string[];
+    [key: string]: unknown;
+  };
+  analysis_summary?: {
+    risk_delta?: number | null;
+    churn_pct?: number | null;
+    turnover_l1?: number | null;
+    max_shift_asset?: string | null;
+    max_shift_delta?: number | null;
+    assets_count?: number;
+    assets_changed_count?: number | null;
+    eps_used?: number;
+    prior_source?: string;
+    notes?: string[];
+    version?: string;
+    [key: string]: unknown;
   };
   [key: string]: unknown;
 }
@@ -247,8 +451,49 @@ interface SimState {
   summary?: unknown;
 }
 
+type SimRegime = "bull" | "bear" | "sideways" | "random";
+type SimPersistence = "low" | "medium" | "high";
+
+interface SimulationContext {
+  sim_id?: string;
+  tick_index?: number;
+  track?: "A" | "B";
+  seed?: string;
+  regime_for_tick?: Record<string, SimRegime>;
+  regime_multipliers?: Record<string, { er_mult: number; vol_mult: number }>;
+}
+
+interface SimulationResult {
+  decision_type: "simulation";
+  schema_version: "sim_v1";
+  sim_id: string;
+  tick_count: number;
+  seed: string;
+  regime_model: "risk_class_based";
+  risk_class_regimes: Record<string, SimRegime>;
+  regime_sequence: Array<{ tick_index: number; per_class: Record<string, SimRegime> }>;
+  baseline: { start_weights: Record<string, number> };
+  results: {
+    A: { ticks: Tick[]; scorecard: Record<string, number | null> };
+    B?: { ticks: Tick[]; scorecard: Record<string, number | null> };
+  };
+}
+
 type AllocatorVersion = "default" | "v1" | "v2" | "v3" | "v4" | "v5" | "v6";
 type DecisionType = "treasury_batch_allocation";
+type RunDecisionType = "allocation" | "simulation";
+type ImportConnectorId = "csv_v1" | "json_v1" | "wallet_evm_v1";
+
+type ImportPreviewAsset = {
+  id: string;
+  name: string;
+  risk_class: string;
+  role?: string;
+  current_weight: number;
+  expected_return: number;
+  volatility: number;
+  source_value_usd: number | null;
+};
 
 interface AllocationPolicy {
   id: string;
@@ -292,6 +537,7 @@ type AbResult = {
 const POLICY_STORAGE_KEY = "sagitta.aaa.v0.0.1.policies";
 const POLICY_SELECTED_KEY = "sagitta.aaa.v0.0.1.selectedPolicyId";
 const SHOW_DEV_PAYLOAD_PREVIEW = false;
+const EM_DASH = "\u2014";
 
 function makePolicyId(nowIso: string) {
   return `policy_${nowIso}`;
@@ -310,10 +556,40 @@ const PORTFOLIO_HEADER_TOOLTIPS: Record<string, string> = {
   id: "Unique asset identifier used throughout the system (e.g., BTC, ETH).",
   name: "Human-readable asset name.",
   risk_class: "Risk classification used by the allocator (affects constraints/heuristics).",
+  role: "Why this asset exists in the portfolio (intent), separate from risk class.",
   current_weight: "Current portfolio weight as a fraction (0.00–1.00). Should sum to ~1.00 across assets.",
   expected_return: "Expected return assumption (model input). Units depend on your convention (e.g., annual, decimal).",
   volatility: "Volatility/risk assumption (model input). Units depend on your convention (e.g., annualized stdev, decimal).",
 };
+
+const ROLE_OPTIONS: string[] = ["core", "satellite", "defensive", "liquidity", "carry", "speculative"];
+
+const RISK_CLASS_OPTIONS: string[] = [
+  "",
+  "stablecoin",
+  "large_cap_crypto",
+  "defi_bluechip",
+  "large_cap_equity_core",
+  "defensive_equity",
+  "growth_high_beta_equity",
+  "high_risk",
+  "equity_fund",
+  "fixed_income",
+  "commodities",
+  "real_estate",
+  "cash_equivalent",
+  "speculative",
+  "traditional_asset",
+  "alternative",
+  "balanced_fund",
+  "emerging_market",
+  "frontier_market",
+  "esoteric",
+  "unclassified",
+  "wealth_management",
+  "fund_of_funds",
+  "index_fund",
+];
 
 export default function Page() {
   const [scenarioId, setScenarioId] = useState<string | null>(null);
@@ -326,12 +602,30 @@ export default function Page() {
   const [constraintsDraft, setConstraintsDraft] = useState<Constraints | null>(null);
   const [inflowDraft, setInflowDraft] = useState<number | null>(null);
   const [weightsWarning, setWeightsWarning] = useState<string | null>(null);
+  const [importModalOpen, setImportModalOpen] = useState<boolean>(false);
+  const [importConnectorId, setImportConnectorId] = useState<ImportConnectorId>("csv_v1");
+  const [importCsvText, setImportCsvText] = useState<string>("");
+  const [importJsonText, setImportJsonText] = useState<string>("");
+  const [importWalletChain, setImportWalletChain] = useState<"ethereum" | "polygon" | "arbitrum">("ethereum");
+  const [importWalletAddress, setImportWalletAddress] = useState<string>("");
+  const [importPreview, setImportPreview] = useState<ImportPreviewResult | null>(null);
+  const [importPreviewAssets, setImportPreviewAssets] = useState<ImportPreviewAsset[]>([]);
+  const [importPreviewLoading, setImportPreviewLoading] = useState<boolean>(false);
+  const [importPreviewError, setImportPreviewError] = useState<string | null>(null);
   const [analysisMode, setAnalysisMode] = useState<boolean>(false);
   const [policies, setPolicies] = useState<AllocationPolicy[]>([]);
   const [selectedPolicyId, setSelectedPolicyId] = useState<string | null>(null);
   const [policyNameDraft, setPolicyNameDraft] = useState<string>("");
   const [allocatorVersion, setAllocatorVersion] = useState<AllocatorVersion>("default");
   const [abResults, setAbResults] = useState<AbResult[]>([]);
+  const [runDecisionType, setRunDecisionType] = useState<RunDecisionType>("allocation");
+  const [simResult, setSimResult] = useState<SimulationResult | null>(null);
+  const [simSelectedTickIndex, setSimSelectedTickIndex] = useState<number>(0);
+  const [simSelectedTrack, setSimSelectedTrack] = useState<"A" | "B">("A");
+  const [simTickCount, setSimTickCount] = useState<number>(10);
+  const [simSeed] = useState<string>(() => `seed_${Date.now()}`);
+  const [simPersistence] = useState<SimPersistence>("medium");
+  const [simRiskClassRegimes, setSimRiskClassRegimes] = useState<Record<string, SimRegime>>({});
 
   const [simStateData, setSimStateData] = useState<SimState | null>(null);
   const [advanceDays, setAdvanceDays] = useState<number>(0);
@@ -353,12 +647,18 @@ export default function Page() {
   const [regimeDraft, setRegimeDraft] = useState<Record<string, unknown> | null>(null);
   const [regimeTouched, setRegimeTouched] = useState<boolean>(false);
   const [regimeError, setRegimeError] = useState<string | null>(null);
+  const constraintsDraftRef = useRef<Constraints | null>(null);
+
+  useEffect(() => {
+    constraintsDraftRef.current = constraintsDraft;
+  }, [constraintsDraft]);
 
   // NEW: inline "Add Asset" draft state (UI-only)
   const [newAssetDraft, setNewAssetDraft] = useState<{
     id: string;
     name: string;
     risk_class: RiskClass | "";
+    role: AssetRole;
     current_weight: string; // keep as string to allow blank/partial input
     expected_return: string;
     volatility: string;
@@ -366,6 +666,7 @@ export default function Page() {
     id: "",
     name: "",
     risk_class: "",
+    role: "satellite",
     current_weight: "",
     expected_return: "",
     volatility: "",
@@ -383,7 +684,17 @@ export default function Page() {
         const base: Portfolio = prev ?? { assets: [] };
         const assets = Array.isArray(base.assets) ? base.assets : [];
         if (!assets[idx]) return base;
-        const nextAssets = assets.map((a, i) => (i === idx ? { ...a, ...patch } : a));
+        const hasWeight = Object.prototype.hasOwnProperty.call(patch, "current_weight");
+        const nextAssets = assets.map((a, i) => {
+          if (i !== idx) return a;
+          if (!hasWeight) return { ...a, ...patch };
+
+          const raw = (patch as { current_weight?: number }).current_weight;
+          const baseWeight = typeof a.current_weight === "number" && Number.isFinite(a.current_weight) ? a.current_weight : 0;
+          const nextWeight = typeof raw === "number" && Number.isFinite(raw) ? raw : baseWeight;
+          const remaining = remainingPortfolioWeight(assets, idx);
+          return { ...a, ...patch, current_weight: clampWeightToRemaining(nextWeight, remaining) };
+        });
         return { ...base, assets: nextAssets };
       });
       setPortfolioTouched(true);
@@ -403,7 +714,7 @@ export default function Page() {
 
   // FIX: make loadScenario always provide a usable portfolioDraft target
   const loadScenario = useCallback(
-    async (sid?: string) => {
+    async (sid?: string, opts?: { preserveConstraints?: boolean }) => {
       const id = sid ?? scenarioId;
       if (!id) return;
 
@@ -424,7 +735,10 @@ export default function Page() {
       setPortfolioDraft(p);
 
       const c = (s?.constraints ?? null) as Constraints | null;
-      if (c) setConstraintsDraft(c);
+      const preserveConstraints = opts?.preserveConstraints && constraintsDraftRef.current;
+      if (!preserveConstraints) {
+        setConstraintsDraft(applyConstraintDefaults(c));
+      }
 
       const inflow = typeof s?.capital_inflow_amount === "number" ? s.capital_inflow_amount : null;
       setInflowDraft(inflow);
@@ -441,13 +755,30 @@ export default function Page() {
 
       setTicks((prev) => {
         const local = Array.isArray(prev) ? prev : [];
+        const localMap = new Map<string, Tick>();
+        for (const tick of local) {
+          if (tick?.tick_id) localMap.set(tick.tick_id, tick);
+        }
 
         // Preserve synthetic client ticks (and any local ticks not yet on server)
         const map = new Map<string, Tick>();
 
         // 1) start with server ticks (authoritative when ids collide)
         for (const tick of serverTicks) {
-          if (tick?.tick_id) map.set(tick.tick_id, tick);
+          const tickId = tick?.tick_id;
+          if (!tickId) continue;
+          const localTick = localMap.get(tickId);
+          if (localTick) {
+            const serverRec = tick as Record<string, unknown>;
+            if (!("_ui_context" in serverRec)) {
+              const localRec = localTick as Record<string, unknown>;
+              if ("_ui_context" in localRec) {
+                map.set(tickId, { ...tick, _ui_context: localRec["_ui_context"] } as Tick);
+                continue;
+              }
+            }
+          }
+          map.set(tickId, tick);
         }
 
         // 2) add local ticks that are missing from server
@@ -504,10 +835,11 @@ export default function Page() {
     const nextAsset: Asset = {
       id,
       name,
-      current_weight,
+      current_weight: Number.isFinite(current_weight) ? current_weight : 0,
       expected_return,
       volatility,
       ...(newAssetDraft.risk_class ? { risk_class: newAssetDraft.risk_class } : {}),
+      role: newAssetDraft.role || "satellite",
     };
 
     setPortfolioDraft((prev) => {
@@ -518,7 +850,9 @@ export default function Page() {
         setMessage(`Asset id '${id}' already exists.`);
         return base;
       }
-      return { ...base, assets: [...baseAssets, nextAsset] };
+      const remaining = remainingPortfolioWeight(baseAssets, -1);
+      const bounded = clampWeightToRemaining(nextAsset.current_weight, remaining);
+      return { ...base, assets: [...baseAssets, { ...nextAsset, current_weight: bounded }] };
     });
 
     setPortfolioTouched(true);
@@ -528,6 +862,7 @@ export default function Page() {
       id: "",
       name: "",
       risk_class: "",
+      role: "satellite",
       current_weight: "",
       expected_return: "",
       volatility: "",
@@ -587,31 +922,74 @@ export default function Page() {
     (decision: Record<string, unknown>): Tick => {
       const nowIso = new Date().toISOString();
       const rand = Math.random().toString(16).slice(2);
-      const tickId = `client_${nowIso}_${rand}`;
+      const tickId =
+        typeof decision["tick_id"] === "string" && decision["tick_id"]
+          ? (decision["tick_id"] as string)
+          : `client_${nowIso}_${rand}`;
+      const timestamp =
+        typeof decision["timestamp"] === "string" && decision["timestamp"]
+          ? (decision["timestamp"] as string)
+          : nowIso;
 
       // Put decision payload somewhere the UI already inspects (plan + top-level target_weights)
       const target_weights = decision["target_weights"];
       const next_allocation_weights = decision["next_allocation_weights"];
+        const decisionAi = decision["ai_explanation"];
+        const decisionNarrative = decision["narrative"];
+        const aiExplanation =
+          decisionAi && typeof decisionAi === "object"
+            ? (decisionAi as Tick["ai_explanation"])
+            : decisionNarrative && typeof decisionNarrative === "object"
+              ? (decisionNarrative as Tick["ai_explanation"])
+              : undefined;
 
       const out: Tick = {
         tick_id: tickId,
-        timestamp: nowIso,
+        timestamp,
         next_allocation_plan: {
           // keep as unknown for now; UI reads via extractTargetWeightsFromTick which checks multiple locations
           allocations_usd: null,
         },
+        schema_version: "tick_v1",
         // stash full decision so Raw tick JSON / explain can show it
         meta: {
           plan_id: typeof decision["plan_id"] === "string" ? (decision["plan_id"] as string) : undefined,
           decision_window_start: typeof decision["decision_window_start"] === "string" ? (decision["decision_window_start"] as string) : undefined,
           decision_window_end: typeof decision["decision_window_end"] === "string" ? (decision["decision_window_end"] as string) : undefined,
         },
+        ai_explanation: aiExplanation,
       };
 
       // attach weights in the common places your extractor checks (no `any`)
       (out as Record<string, unknown>)["target_weights"] = target_weights;
       (out as Record<string, unknown>)["next_allocation_weights"] = next_allocation_weights;
-      (out as Record<string, unknown>)["_decision_raw"] = decision;
+        const decisionKeys = [
+          "allocator_version",
+          "policy_id",
+          "policy_name",
+          "analysis_meta",
+          "decision_type",
+          "prior_tick_id",
+          "prior_target_weights",
+          "prior_source",
+          "prior_portfolio_weights",
+          "policy_snapshot",
+          "risk_summary",
+          "stability_metrics",
+          "pruning_summary",
+          "analysis_summary",
+          "linkage_scope",
+          "warnings",
+        ];
+      for (const key of decisionKeys) {
+        if (key in decision) {
+          (out as Record<string, unknown>)[key] = decision[key];
+        }
+      }
+      const rawDecision: Record<string, unknown> = {};
+      if ("score_trace_by_asset" in decision) rawDecision["score_trace_by_asset"] = decision["score_trace_by_asset"];
+      if ("meta" in decision) rawDecision["meta"] = decision["meta"];
+      (out as Record<string, unknown>)["_decision_raw"] = rawDecision;
 
       return out;
     },
@@ -684,28 +1062,90 @@ export default function Page() {
     setMessage("Portfolio saved");
   }, [portfolioDraft, portfolioNameDraft, selectedSavedPortfolioId]);
 
-  const importPortfolioFromJson = useCallback(() => {
-    if (typeof window === "undefined") return;
-
-    const text = window.prompt("Paste portfolio JSON");
-    if (!text) return;
-
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      const rec = parsed as Record<string, unknown>;
-      const pRaw = (rec?.["portfolio"] ?? parsed) as Portfolio | null;
-
-      const assets = Array.isArray((pRaw as Portfolio | null)?.assets) ? (pRaw as Portfolio).assets : [];
-      const p: Portfolio = { ...((pRaw as Portfolio) ?? {}), assets };
-
-      setPortfolioDraft(p);
-      setPortfolioTouched(true);
-      setSelectedSavedPortfolioId("");
-      setMessage("Portfolio imported");
-    } catch {
-      setMessage("Invalid JSON");
-    }
+  const resetImportPreview = useCallback(() => {
+    setImportPreview(null);
+    setImportPreviewAssets([]);
+    setImportPreviewError(null);
   }, []);
+
+  const onOpenImportModal = useCallback(() => {
+    setImportModalOpen(true);
+    resetImportPreview();
+  }, [resetImportPreview]);
+
+  const onCloseImportModal = useCallback(() => {
+    setImportModalOpen(false);
+    resetImportPreview();
+  }, [resetImportPreview]);
+
+  const onPreviewImport = useCallback(async () => {
+    setImportPreviewLoading(true);
+    setImportPreviewError(null);
+    try {
+      const payload =
+        importConnectorId === "csv_v1"
+          ? { csv_text: importCsvText, provider_hint: "generic" }
+          : importConnectorId === "json_v1"
+            ? { json_text: importJsonText, provider_hint: "generic" }
+            : { chain: importWalletChain, address: importWalletAddress };
+      const result = (await previewPortfolioImport(importConnectorId, payload)) as ImportPreviewResult;
+      setImportPreview(result);
+      setImportPreviewAssets(Array.isArray(result.proposed_assets) ? (result.proposed_assets as ImportPreviewAsset[]) : []);
+    } catch (e) {
+      setImportPreviewError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setImportPreviewLoading(false);
+    }
+  }, [importConnectorId, importCsvText, importJsonText, importWalletChain, importWalletAddress]);
+
+  const onUpdatePreviewRiskClass = useCallback((idx: number, risk_class: string) => {
+    setImportPreviewAssets((prev) => {
+      const next = [...prev];
+      if (!next[idx]) return prev;
+      const priors = applyPriors(risk_class);
+      next[idx] = {
+        ...next[idx],
+        risk_class,
+        expected_return: priors.expected_return,
+        volatility: priors.volatility,
+      };
+      return next;
+    });
+  }, []);
+
+  const onUpdatePreviewRole = useCallback((idx: number, role: string) => {
+    setImportPreviewAssets((prev) => {
+      const next = [...prev];
+      if (!next[idx]) return prev;
+      next[idx] = {
+        ...next[idx],
+        role,
+      };
+      return next;
+    });
+  }, []);
+
+  const onApplyImportToPortfolio = useCallback(() => {
+    if (!importPreviewAssets.length) return;
+    if (typeof window !== "undefined") {
+      const ok = window.confirm("Replace current portfolio rows with imported assets?");
+      if (!ok) return;
+    }
+
+    setPortfolioDraft({ assets: importPreviewAssets.map((a) => ({
+      id: a.id,
+      name: a.name,
+      risk_class: a.risk_class as RiskClass,
+      role: (a.role as AssetRole) || "satellite",
+      current_weight: a.current_weight,
+      expected_return: a.expected_return,
+      volatility: a.volatility,
+    }))});
+    setPortfolioTouched(true);
+    setSelectedSavedPortfolioId("");
+    setMessage("Portfolio imported into editor");
+    setImportModalOpen(false);
+  }, [importPreviewAssets]);
 
   // NEW: load saved portfolios on mount
   useEffect(() => {
@@ -743,17 +1183,27 @@ export default function Page() {
           const p = policies.find((x) => x.id === selectedPolicyId);
           return p?.name ? p.name : selectedPolicyId;
         })()
-      : "(unsaved)";
+      : ((policyNameDraft || "").trim() || "(unsaved)");
 
     return { portfolioLabel, policyLabel };
-  }, [policies, savedPortfolios, selectedPolicyId, selectedSavedPortfolioId]);
+  }, [policies, policyNameDraft, savedPortfolios, selectedPolicyId, selectedSavedPortfolioId]);
 
   // CHANGE: ensure runTick refresh makes Decision Results appear reliably
   const onRunTick = useCallback(async () => {
     if (!scenarioId) return;
     setLoading(true);
     try {
-      const created: unknown = await runTick(scenarioId);
+      const selectedPolicy = selectedPolicyId ? policies.find((p) => p.id === selectedPolicyId) ?? null : null;
+      const allocatorToUseRaw = selectedPolicy?.allocatorVersion ?? allocatorVersion;
+      const allocatorToUse = allocatorToUseRaw === "default" ? "v1" : allocatorToUseRaw;
+      await putAllocatorVersion(scenarioId, allocatorToUse);
+      const policyNameForRun = (selectedPolicy?.name ?? policyNameDraft ?? "").trim() || null;
+      const created: unknown = await runTick(scenarioId, {
+        decision_type: runDecisionType,
+        allocator_version: allocatorToUse,
+        policy_id: selectedPolicy?.id ?? selectedPolicyId ?? null,
+        policy_name: policyNameForRun,
+      });
 
       let createdTick: Tick | null = normalizeTickForList(
         created && typeof created === "object" ? (created as Tick) : null
@@ -774,6 +1224,7 @@ export default function Page() {
             policyLabel,
             portfolioId: selectedSavedPortfolioId || null,
             policyId: selectedPolicyId || null,
+            decisionType: runDecisionType,
           },
         } as Tick;
 
@@ -801,6 +1252,10 @@ export default function Page() {
     getExecutionContextLabels,
     selectedSavedPortfolioId,
     selectedPolicyId,
+    runDecisionType,
+    allocatorVersion,
+    policyNameDraft,
+    policies,
   ]);
 
   const savePortfolioApi = useCallback(
@@ -843,6 +1298,32 @@ export default function Page() {
     [scenarioId]
   );
 
+  const constraintsValidationError = useMemo(() => {
+    if (!constraintsDraft) return "Constraints not set.";
+    const min = constraintsDraft.min_asset_weight;
+    const max = constraintsDraft.max_asset_weight;
+    const conc = constraintsDraft.max_concentration;
+    const isNum = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+
+    if (!isNum(min)) return "Minimum Asset Weight must be a number.";
+    if (!isNum(max)) return "Maximum Asset Weight must be a number.";
+    if (!isNum(conc)) return "Maximum Concentration must be a number.";
+
+    if (min! < 0 || min! > 1) return "Minimum Asset Weight must be between 0 and 1.";
+    if (max! < 0 || max! > 1) return "Maximum Asset Weight must be between 0 and 1.";
+    if (conc! < 0 || conc! > 1) return "Maximum Concentration must be between 0 and 1.";
+
+    if (min! > max!) return "Minimum Asset Weight cannot exceed Maximum Asset Weight.";
+    if (max! > conc!) return "Maximum Asset Weight cannot exceed Maximum Concentration.";
+    return null;
+  }, [constraintsDraft]);
+
+  const validateConstraints = useCallback(() => {
+    if (!constraintsTouched) return false;
+    if (!scenarioId) return false;
+    return !constraintsValidationError;
+  }, [constraintsTouched, scenarioId, constraintsValidationError]);
+
   const portfolioAutosave = useDebouncedAutosave<Portfolio | null>(
     portfolioDraft,
     async (val) => {
@@ -867,7 +1348,7 @@ export default function Page() {
     },
     {
       delay: 800,
-      validate: () => !!scenarioId && constraintsTouched,
+      validate: validateConstraints,
       onSaved: () => {
         setConstraintsTouched(false);
         void loadScenario();
@@ -983,7 +1464,7 @@ export default function Page() {
       onSaved: () => {
         setRegimeTouched(false);
         setRegimeError(null);
-        void loadScenario();
+        void loadScenario(undefined, { preserveConstraints: true });
       },
     }
   );
@@ -1025,7 +1506,7 @@ export default function Page() {
     const p = policies.find((x) => x.id === selectedPolicyId);
     if (!p) return;
 
-    setConstraintsDraft(p.constraints ?? {});
+    setConstraintsDraft(applyConstraintDefaults(p.constraints ?? null));
     setConstraintsTouched(false);
 
     setRegimeDraft((p.regime ?? {}) as Record<string, unknown>);
@@ -1066,7 +1547,7 @@ export default function Page() {
     setSelectedPolicyId(null);
     setPolicyNameDraft("");
     setAllocatorVersion("default");
-    setConstraintsDraft({});
+    setConstraintsDraft({ ...CONSTRAINT_DEFAULTS });
     setConstraintsTouched(false);
 
     const nextDefault = buildDefaultRegimeDraft();
@@ -1080,6 +1561,7 @@ export default function Page() {
     return {
       scenarioId,
       decisionType: "treasury_batch_allocation",
+      runDecisionType,
       allocatorVersion,
       portfolio: portfolioDraft,
       constraints: constraintsDraft,
@@ -1088,7 +1570,7 @@ export default function Page() {
       analysisMode,
       sessionMode: mode,
     };
-  }, [allocatorVersion, analysisMode, constraintsDraft, inflowDraft, mode, portfolioDraft, regimeDraft, scenarioId]);
+  }, [allocatorVersion, analysisMode, constraintsDraft, inflowDraft, mode, portfolioDraft, regimeDraft, runDecisionType, scenarioId]);
 
   async function ensureSimulationScenario(): Promise<string | null> {
     if (mode === "protocol") return scenarioId;
@@ -1136,12 +1618,42 @@ export default function Page() {
   }
 
   useEffect(() => {
-    if (!constraintsDraft) setConstraintsDraft({});
+    if (!constraintsDraft) setConstraintsDraft({ ...CONSTRAINT_DEFAULTS });
   }, [constraintsDraft]);
 
   useEffect(() => {
     if (!regimeDraft) setRegimeDraft({});
   }, [regimeDraft]);
+
+  useEffect(() => {
+    if (runDecisionType === "simulation" && analysisMode) {
+      setAnalysisMode(false);
+    }
+  }, [analysisMode, runDecisionType]);
+
+  const simRiskClasses = useMemo(() => {
+    const assets = portfolioDraft?.assets ?? [];
+    const classes = new Set<string>();
+    for (const a of assets) {
+      const rc = String(a.risk_class || "unknown").trim() || "unknown";
+      classes.add(rc);
+    }
+    if (!classes.size) classes.add("unknown");
+    return Array.from(classes).sort();
+  }, [portfolioDraft]);
+
+  useEffect(() => {
+    setSimRiskClassRegimes((prev) => {
+      const next: Record<string, SimRegime> = { ...prev };
+      for (const rc of simRiskClasses) {
+        if (!next[rc]) next[rc] = "random";
+      }
+      for (const key of Object.keys(next)) {
+        if (!simRiskClasses.includes(key)) delete next[key];
+      }
+      return next;
+    });
+  }, [simRiskClasses]);
 
   const latestTick = useMemo(() => {
     // Prefer scenario.last_tick if present; otherwise fall back to newest ticks[]
@@ -1228,18 +1740,119 @@ export default function Page() {
     [currentWeights]
   );
 
+  const buildAllocationRowsFromPrior = useCallback(
+    (prior: Record<string, number> | null, tw: Record<string, number> | null) => {
+      const base = prior ?? {};
+      const target = tw ?? {};
+      const hasPrior = prior !== null && Object.keys(base).length > 0;
+      const ids = Array.from(new Set([...Object.keys(base), ...Object.keys(target)])).sort();
+      const rows = ids.map((id) => {
+        const tgt = Number(target[id] ?? 0);
+        if (!hasPrior) {
+          return { id, cur: null as number | null, tgt, delta: null as number | null };
+        }
+        const cur = Number(base[id] ?? 0);
+        const delta = tgt - cur;
+        return { id, cur, tgt, delta };
+      });
+      const sumAbs = rows.reduce((acc, r) => acc + Math.abs(r.delta ?? 0), 0);
+      const turnover = 0.5 * sumAbs;
+      return { rows, turnover };
+    },
+    []
+  );
+
   const [hiddenTickIds, setHiddenTickIds] = useState<Set<string>>(new Set());
   const [expandedTickIds, setExpandedTickIds] = useState<Set<string>>(new Set());
+  const [expandedAbRunIds, setExpandedAbRunIds] = useState<Set<string>>(new Set());
   const [expandedExplainIds, setExpandedExplainIds] = useState<Set<string>>(new Set());
+  const [explainPendingIds, setExplainPendingIds] = useState<Set<string>>(new Set());
+  const [explainOverrides, setExplainOverrides] = useState<Record<string, unknown>>({});
 
   // NEW: prevents auto-expand from fighting the user's manual toggles
   const [tickUiTouched, setTickUiTouched] = useState<boolean>(false);
+  const [abUiTouched, setAbUiTouched] = useState<boolean>(false);
 
   const formatTs = useCallback((v?: string) => {
     if (!v) return "—";
     const d = new Date(v);
     return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString();
   }, []);
+
+  const resolveScenarioIdForTick = useCallback(
+    (tick: Tick): string | null => {
+      const obj = tick as unknown as Record<string, unknown>;
+      const linkage = obj["linkage_scope"];
+      if (linkage && typeof linkage === "object") {
+        const accountId = (linkage as Record<string, unknown>)["account_id"];
+        if (typeof accountId === "string" && accountId) return accountId;
+      }
+      if (tick.tick_id) {
+        const prefix = tick.tick_id.split(":")[0];
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(prefix)) {
+          return prefix;
+        }
+      }
+      return scenarioId || null;
+    },
+    [scenarioId]
+  );
+
+  const requestExplainForTick = useCallback(
+    async (tick: Tick) => {
+      if (!tick.tick_id) return;
+      if (explainPendingIds.has(tick.tick_id)) return;
+      if (explainOverrides[tick.tick_id]) return;
+      const existing =
+        (tick as Record<string, unknown>)["ai_explanation"] ?? (tick as Record<string, unknown>)["narrative"];
+      if (existing) return;
+
+      const sid = resolveScenarioIdForTick(tick);
+      if (!sid) {
+        setExplainOverrides((prev) => ({
+          ...prev,
+          [tick.tick_id]: {
+            summary: "AI explanation unavailable.",
+            rationale_bullets: ["Missing scenario context for this tick."],
+            risk_notes: [],
+            confidence: "low",
+            meta: { enabled: false, model: "(disabled)", error: "missing_scenario_id" },
+          },
+        }));
+        return;
+      }
+
+      setExplainPendingIds((prev) => new Set(prev).add(tick.tick_id));
+      try {
+        const res = await explainTick(sid, tick.tick_id);
+        setExplainOverrides((prev) => ({ ...prev, [tick.tick_id]: res }));
+        setTicks((prev) =>
+          prev.map((t) =>
+            t.tick_id === tick.tick_id ? { ...t, ai_explanation: res as Tick["ai_explanation"] } : t
+          )
+        );
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : "unknown_error";
+        setExplainOverrides((prev) => ({
+          ...prev,
+          [tick.tick_id]: {
+            summary: "AI explanation unavailable.",
+            rationale_bullets: ["The explainer request failed.", "Try again later."],
+            risk_notes: [],
+            confidence: "low",
+            meta: { enabled: false, model: "(disabled)", error: `explain_request_failed:${detail}` },
+          },
+        }));
+      } finally {
+        setExplainPendingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(tick.tick_id);
+          return next;
+        });
+      }
+    },
+    [explainOverrides, explainPendingIds, resolveScenarioIdForTick]
+  );
 
   const extractTargetWeightsFromTick = useCallback((tick: Tick | null): Record<string, number> | null => {
     if (!tick) return null;
@@ -1263,6 +1876,51 @@ export default function Page() {
     return Object.keys(out).length ? out : null;
   }, []);
 
+  const computeWeightDeltaL1 = useCallback(
+    (a: Record<string, number> | null, b: Record<string, number> | null, eps = 1e-6): number | null => {
+      if (!a || !b) return null;
+      const ids = new Set<string>([...Object.keys(a), ...Object.keys(b)]);
+      let sumAbs = 0;
+      ids.forEach((id) => {
+        const av = typeof a[id] === "number" ? a[id] : 0;
+        const bv = typeof b[id] === "number" ? b[id] : 0;
+        sumAbs += Math.abs(av - bv);
+      });
+      const delta = 0.5 * sumAbs;
+      return delta <= eps ? 0 : delta;
+    },
+    []
+  );
+
+  const buildExportPayload = useCallback((tick: Tick) => {
+    const t = tick as unknown as Record<string, unknown>;
+    const decisionType = typeof t["decision_type"] === "string" ? (t["decision_type"] as string) : "allocation";
+    const tickWithSchema = {
+      ...tick,
+      schema_version: typeof t["schema_version"] === "string" ? (t["schema_version"] as string) : "tick_v1",
+    };
+    return {
+      schema_version: "tick_export_v1",
+      exported_at: new Date().toISOString(),
+      ...(decisionType === "simulation" ? { export_label: "SIMULATION" } : {}),
+      tick: tickWithSchema,
+      decision: {
+        policy_snapshot: t["policy_snapshot"] ?? null,
+        risk_summary: t["risk_summary"] ?? null,
+        stability_metrics: t["stability_metrics"] ?? null,
+        pruning_summary: t["pruning_summary"] ?? null,
+        role_effects: t["role_effects"] ?? null,
+        role_constraints_summary: t["role_constraints_summary"] ?? null,
+        analysis_summary: t["analysis_summary"] ?? null,
+        policy_effects: t["policy_effects"] ?? null,
+        policy_sensitivity: t["policy_sensitivity"] ?? null,
+        policy_equivalence: t["policy_equivalence"] ?? null,
+        linkage_scope: t["linkage_scope"] ?? null,
+        warnings: t["warnings"] ?? null,
+      },
+    };
+  }, []);
+
   const downloadJson = useCallback((filename: string, obj: unknown) => {
     const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1277,10 +1935,10 @@ export default function Page() {
 
   const onExportTick = useCallback(
     (tick: Tick) => {
-      const tw = extractTargetWeightsFromTick(tick);
-      downloadJson(`tick_${tick.tick_id || "unknown"}.json`, { tick, target_weights: tw });
+      const payload = buildExportPayload(tick);
+      downloadJson(`tick_${tick.tick_id || "unknown"}.json`, payload);
     },
-    [downloadJson, extractTargetWeightsFromTick]
+    [buildExportPayload, downloadJson]
   );
 
   const onDeleteTickLocal = useCallback((tick: Tick) => {
@@ -1302,20 +1960,526 @@ export default function Page() {
     });
   }, []);
 
-  const onToggleExplain = useCallback((tick: Tick) => {
-    setTickUiTouched(true);
-    setExpandedExplainIds((prev) => {
-      const next = new Set(prev);
-      if (!tick.tick_id) return next;
-      if (next.has(tick.tick_id)) next.delete(tick.tick_id);
-      else next.add(tick.tick_id);
-      return next;
-    });
+  const onToggleExplain = useCallback(
+    (tick: Tick) => {
+      if (!tick.tick_id) return;
+      setTickUiTouched(true);
+      const shouldOpen = !expandedExplainIds.has(tick.tick_id);
+      setExpandedExplainIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(tick.tick_id)) next.delete(tick.tick_id);
+        else next.add(tick.tick_id);
+        return next;
+      });
+      if (shouldOpen) {
+        setExpandedTickIds((prev) => {
+          const next = new Set(prev);
+          next.add(tick.tick_id as string);
+          return next;
+        });
+        void requestExplainForTick(tick);
+      }
+    },
+    [expandedExplainIds, requestExplainForTick]
+  );
+
+  const getExplainPayloadFromTick = useCallback(
+    (tick: Tick): unknown => {
+      if (!tick.tick_id) {
+        return {
+          summary: "AI explanation unavailable.",
+          rationale_bullets: ["Missing tick_id; cannot request an explanation."],
+          risk_notes: [],
+          confidence: "low",
+          meta: { enabled: false, model: "(disabled)", error: "missing_tick_id" },
+        };
+      }
+
+      const override = explainOverrides[tick.tick_id];
+      if (override && typeof override === "object") return override;
+
+      const obj = tick as unknown as Record<string, unknown>;
+      const expl = obj["ai_explanation"] ?? obj["narrative"];
+      if (expl) return expl;
+
+      if (explainPendingIds.has(tick.tick_id)) {
+        return {
+          summary: "Generating explanation...",
+          rationale_bullets: ["This may take a few seconds."],
+          risk_notes: [],
+          confidence: "low",
+          meta: { enabled: false, model: "(pending)", status: "pending" },
+        };
+      }
+
+      return {
+        summary: "Explanation not requested.",
+        rationale_bullets: ["Click Explain to request a deterministic summary."],
+        risk_notes: [],
+        confidence: "low",
+        meta: { enabled: false, model: "(not_requested)", status: "not_requested" },
+      };
+    },
+    [explainOverrides, explainPendingIds]
+  );
+
+  const getAnalysisSummaryFromTick = useCallback((tick: Tick): Record<string, unknown> | null => {
+    const obj = tick as unknown as Record<string, unknown>;
+    const analysis = obj["analysis_summary"];
+    return analysis && typeof analysis === "object" ? (analysis as Record<string, unknown>) : null;
   }, []);
 
-  const getExplainPayloadFromTick = useCallback((tick: Tick): unknown => {
+  const getPruningSummaryFromTick = useCallback((tick: Tick): Record<string, unknown> | null => {
     const obj = tick as unknown as Record<string, unknown>;
-    return obj["ai_explanation"] ?? obj["narrative"] ?? null;
+    const pruning = obj["pruning_summary"];
+    return pruning && typeof pruning === "object" ? (pruning as Record<string, unknown>) : null;
+  }, []);
+
+  const getPolicyEffectsFromTick = useCallback((tick: Tick): Record<string, unknown> | null => {
+    const obj = tick as unknown as Record<string, unknown>;
+    const effects = obj["policy_effects"];
+    return effects && typeof effects === "object" ? (effects as Record<string, unknown>) : null;
+  }, []);
+
+  const getRoleEffectsFromTick = useCallback((tick: Tick): Record<string, unknown> | null => {
+    const obj = tick as unknown as Record<string, unknown>;
+    const effects = obj["role_effects"];
+    return effects && typeof effects === "object" ? (effects as Record<string, unknown>) : null;
+  }, []);
+
+  const getPolicySensitivityFromTick = useCallback((tick: Tick): Record<string, unknown> | null => {
+    const obj = tick as unknown as Record<string, unknown>;
+    const sensitivity = obj["policy_sensitivity"];
+    return sensitivity && typeof sensitivity === "object" ? (sensitivity as Record<string, unknown>) : null;
+  }, []);
+
+  const getPolicyEquivalenceFromTick = useCallback((tick: Tick): Record<string, unknown> | null => {
+    const obj = tick as unknown as Record<string, unknown>;
+    const eq = obj["policy_equivalence"];
+    return eq && typeof eq === "object" ? (eq as Record<string, unknown>) : null;
+  }, []);
+
+  const isPolicyEquivalentForTick = useCallback(
+    (tick: Tick): boolean => {
+      const sensitivity = getPolicySensitivityFromTick(tick);
+      const equivalence = getPolicyEquivalenceFromTick(tick);
+      if (typeof sensitivity?.["equivalent"] === "boolean") {
+        return sensitivity["equivalent"] as boolean;
+      }
+      if (typeof equivalence?.["equivalent"] === "boolean") {
+        return equivalence["equivalent"] as boolean;
+      }
+      const weightDelta =
+        typeof sensitivity?.["weight_delta_l1_vs_baseline"] === "number"
+          ? (sensitivity?.["weight_delta_l1_vs_baseline"] as number)
+          : null;
+      return weightDelta !== null && Math.abs(weightDelta) <= 1e-6;
+    },
+    [getPolicySensitivityFromTick, getPolicyEquivalenceFromTick]
+  );
+
+  const getPriorWeightsFromTick = useCallback((tick: Tick): Record<string, number> | null => {
+    const obj = tick as unknown as Record<string, unknown>;
+    const prior = obj["prior_portfolio_weights"] ?? obj["prior_target_weights"];
+    if (!prior || typeof prior !== "object") return null;
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(prior as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[String(k)] = v;
+    }
+    return Object.keys(out).length ? out : null;
+  }, []);
+
+  // NEW: small reader for the labels when rendering
+  const getTickContextLabel = useCallback(
+    (t: Tick, kind: "portfolio" | "policy"): string => {
+      const obj = t as unknown as Record<string, unknown>;
+      if (kind === "policy") {
+        const directName = typeof obj["policy_name"] === "string" ? (obj["policy_name"] as string).trim() : "";
+        if (directName) return directName;
+        const directId = typeof obj["policy_id"] === "string" ? (obj["policy_id"] as string).trim() : "";
+        if (directId) return directId;
+        const snapshot = obj["policy_snapshot"];
+        if (snapshot && typeof snapshot === "object") {
+          const snap = snapshot as Record<string, unknown>;
+          const snapName = typeof snap["policy_name"] === "string" ? (snap["policy_name"] as string).trim() : "";
+          if (snapName) return snapName;
+          const snapId = typeof snap["policy_id"] === "string" ? (snap["policy_id"] as string).trim() : "";
+          if (snapId) return snapId;
+        }
+      }
+
+      const rec = obj["_ui_context"];
+      if (!rec || typeof rec !== "object") return kind === "portfolio" ? "(current)" : "(unsaved)";
+      const ctx = rec as Record<string, unknown>;
+      const key = kind === "portfolio" ? "portfolioLabel" : "policyLabel";
+      return typeof ctx[key] === "string" && ctx[key] ? (ctx[key] as string) : kind === "portfolio" ? "(current)" : "(unsaved)";
+    },
+    []
+  );
+
+  const renderDecisionAnalysisStrip = useCallback(
+    (tick: Tick) => {
+      const analysis = getAnalysisSummaryFromTick(tick);
+      const pruning = getPruningSummaryFromTick(tick);
+      const missing = !analysis;
+      const notes = Array.isArray(analysis?.["notes"]) ? (analysis?.["notes"] as string[]) : [];
+      const missingSource = notes.includes("MISSING_PRIOR");
+
+      const riskDelta = typeof analysis?.["risk_delta"] === "number" ? (analysis?.["risk_delta"] as number) : null;
+      const churnPct = typeof analysis?.["churn_pct"] === "number" ? (analysis?.["churn_pct"] as number) : null;
+      const maxShiftAsset =
+        typeof analysis?.["max_shift_asset"] === "string" ? (analysis?.["max_shift_asset"] as string) : null;
+      const maxShiftDelta =
+        typeof analysis?.["max_shift_delta"] === "number" ? (analysis?.["max_shift_delta"] as number) : null;
+      const sourcePortfolioLabel = getTickContextLabel(tick, "portfolio");
+
+      const prunedAssets = Array.isArray(pruning?.["pruned_assets"]) ? (pruning?.["pruned_assets"] as string[]) : [];
+      const prunedCount =
+        typeof pruning?.["pruned_count"] === "number" ? (pruning?.["pruned_count"] as number) : prunedAssets.length;
+      const prunedDetails = prunedAssets.length ? ` (${prunedAssets.join(", ")})` : "";
+
+      const fmt = (v: number | null, digits = 4) => (v === null ? "—" : v.toFixed(digits));
+      const fmtPct = (v: number | null) => (v === null ? "—" : `${v.toFixed(2)}%`);
+      const riskDeltaColor = riskDelta === null ? "#999" : riskDelta > 0 ? "#b12a2a" : riskDelta < 0 ? "#1b7f3a" : "#ddd";
+      const missingTitle = missingSource ? "Needs source portfolio snapshot." : undefined;
+
+      return (
+        <div style={{ background: "#0b0b0b", padding: 10, borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <strong>Decision Analysis</strong>
+            {missing ? (
+              <span style={{ fontSize: 12, color: "#7a4a00", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.35)", padding: "2px 8px", borderRadius: 999 }}>
+                Analysis unavailable
+              </span>
+            ) : null}
+          </div>
+          <div style={{ color: "#888", fontSize: 12, marginTop: 4 }}>Deterministic metrics computed by analyzer</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginTop: 8, color: "#ddd", fontSize: 13 }}>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Risk Δ</div>
+              <div style={{ fontWeight: 600, color: riskDeltaColor }} title={missingTitle}>
+                {riskDelta === null
+                  ? "—"
+                  : `${riskDelta > 0 ? "▲ " : riskDelta < 0 ? "▼ " : ""}${fmt(riskDelta, 4)}`}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Churn %</div>
+              <div style={{ fontWeight: 600 }} title={missingTitle}>{fmtPct(churnPct)}</div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Max shift</div>
+              <div style={{ fontWeight: 600 }} title={missingTitle}>
+                {maxShiftAsset && maxShiftDelta !== null ? `${maxShiftAsset} (${fmtPct(maxShiftDelta * 100)})` : "—"}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Pruned count</div>
+              <div style={{ fontWeight: 600 }} title={prunedAssets.length ? prunedAssets.join(", ") : "No pruned assets"}>
+                {missing ? "—" : `${prunedCount}${prunedDetails}`}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Source portfolio</div>
+              <div style={{ fontWeight: 600 }}>{sourcePortfolioLabel || "—"}</div>
+            </div>
+          </div>
+        </div>
+      );
+    },
+    [getAnalysisSummaryFromTick, getPruningSummaryFromTick, getTickContextLabel]
+  );
+
+  const renderPolicyImpactSection = useCallback(
+    (tick: Tick) => {
+      const obj = tick as unknown as Record<string, unknown>;
+      const effects = getPolicyEffectsFromTick(tick);
+      const roleEffects = getRoleEffectsFromTick(tick);
+      const sensitivity = getPolicySensitivityFromTick(tick);
+      const equivalence = getPolicyEquivalenceFromTick(tick);
+      const applied = effects?.["applied_effects"];
+      const policySnapshot = obj["policy_snapshot"] && typeof obj["policy_snapshot"] === "object"
+        ? (obj["policy_snapshot"] as Record<string, unknown>)
+        : null;
+      const rolePolicy = obj["role_policy"] && typeof obj["role_policy"] === "object"
+        ? (obj["role_policy"] as Record<string, unknown>)
+        : null;
+      const roleSummaryRaw = Array.isArray(obj["role_constraints_summary"])
+        ? (obj["role_constraints_summary"] as string[])
+        : [];
+      const roleStatus = typeof roleEffects?.["status"] === "string" ? (roleEffects?.["status"] as string) : null;
+      const roleBlockers = Array.isArray(roleEffects?.["blockers"]) ? (roleEffects?.["blockers"] as string[]) : [];
+      const roleTransfers = Array.isArray(roleEffects?.["transfers"])
+        ? (roleEffects?.["transfers"] as Array<Record<string, unknown>>)
+        : [];
+      const roleSummary = Array.from(new Set(roleSummaryRaw.filter((item) => !!item)));
+      const hasDominanceLine = roleSummary.some((item) => String(item).toLowerCase().includes("core dominance"));
+      if (!hasDominanceLine && roleStatus) {
+        const statusLabel =
+          roleStatus === "applied"
+            ? "Core dominance applied."
+            : roleStatus === "blocked_by_constraints"
+            ? "Core dominance blocked by constraints."
+            : roleStatus === "not_needed"
+            ? "Core dominance not needed."
+            : `Core dominance status: ${roleStatus}`;
+        roleSummary.push(statusLabel);
+      }
+      if (roleBlockers.length) {
+        roleSummary.push(`Core dominance blockers: ${roleBlockers.join(", ")}`);
+      }
+      if (roleTransfers.length) {
+        roleSummary.push(`Core dominance transfers: ${roleTransfers.length}`);
+      }
+      const roleEffectsAvailable = roleSummary.length > 0 || !!rolePolicy || !!roleEffects;
+
+      const { value: activeVersion, missing: versionMissing } = resolveAllocatorVersion(obj);
+      const { label: activePolicyLabel } = resolvePolicyRef(obj);
+      const analyzerVersion = resolveAnalyzerVersion(obj);
+      const impactDetails = buildPolicyImpactDetails({
+        version: activeVersion,
+        effects,
+        sensitivity,
+        policySnapshot,
+      });
+      const effectsAvailable = impactDetails.effectsAvailable;
+
+      const erMult = typeof (applied as Record<string, unknown> | undefined)?.["expected_return_multiplier"] === "number"
+        ? ((applied as Record<string, unknown>)["expected_return_multiplier"] as number)
+        : null;
+      const volMult = typeof (applied as Record<string, unknown> | undefined)?.["volatility_multiplier"] === "number"
+        ? ((applied as Record<string, unknown>)["volatility_multiplier"] as number)
+        : null;
+      const riskMult = typeof (applied as Record<string, unknown> | undefined)?.["risk_budget_multiplier"] === "number"
+        ? ((applied as Record<string, unknown>)["risk_budget_multiplier"] as number)
+        : null;
+      const corrApplied = typeof (applied as Record<string, unknown> | undefined)?.["correlation_penalty_applied"] === "boolean"
+        ? ((applied as Record<string, unknown>)["correlation_penalty_applied"] as boolean)
+        : null;
+      const liqApplied = typeof (applied as Record<string, unknown> | undefined)?.["liquidity_penalty_applied"] === "boolean"
+        ? ((applied as Record<string, unknown>)["liquidity_penalty_applied"] as boolean)
+        : null;
+
+      const weightDelta =
+        typeof sensitivity?.["weight_delta_l1_vs_baseline"] === "number"
+          ? (sensitivity?.["weight_delta_l1_vs_baseline"] as number)
+          : null;
+      const normalizationDominated = !!sensitivity?.["normalization_dominated"];
+      const constraintBindingChanged = !!sensitivity?.["constraint_binding_changed"];
+      const rankingChanged = !!sensitivity?.["ranking_changed"];
+      const pruningChanged = !!sensitivity?.["pruning_changed"];
+      const equivalent =
+        (typeof sensitivity?.["equivalent"] === "boolean" && (sensitivity?.["equivalent"] as boolean))
+        || (typeof equivalence?.["equivalent"] === "boolean" && (equivalence?.["equivalent"] as boolean))
+        || (weightDelta !== null && Math.abs(weightDelta) <= 1e-6);
+
+      const bindingFactors = Array.isArray(sensitivity?.["binding_factors"])
+        ? (sensitivity?.["binding_factors"] as string[])
+        : [];
+      const inactiveKnobReasons = impactDetails.inactiveKnobReasons;
+      const divergenceConditions = impactDetails.divergenceConditions;
+
+      let summary = "Policy impact unavailable.";
+      if (!effectsAvailable) {
+        summary = "No policy-level effects computed for this run.";
+      } else if (effects && sensitivity) {
+        if (equivalent) {
+          if (bindingFactors.length === 0) {
+            summary = "No policy-level effects observed under current conditions.";
+          } else if (normalizationDominated || constraintBindingChanged) {
+            summary = "Policy parameters altered allocator inputs, but final allocation was unchanged due to binding constraints or normalization.";
+          } else {
+            summary = "Policy parameters did not change the final allocation under the current source portfolio.";
+          }
+        } else if (rankingChanged || pruningChanged) {
+          summary = "Policy parameters altered allocator inputs and changed asset ranking or pruning.";
+        } else if (constraintBindingChanged) {
+          summary = "Policy parameters were overridden by binding constraints.";
+        } else {
+          summary = "Policy parameters produced a measurable change in the allocation.";
+        }
+      }
+
+      const notes = Array.isArray(effects?.["notes"]) ? (effects?.["notes"] as string[]) : [];
+
+      return (
+        <details style={{ background: "#0b0b0b", padding: 10, borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", marginBottom: 10 }}>
+          <summary style={{ cursor: "pointer", listStyle: "none" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <strong>Policy Impact &amp; Sensitivity</strong>
+              {equivalent ? (
+                <span style={{ fontSize: 12, color: "#2a7a3a", background: "rgba(16,185,129,0.12)", border: "1px solid rgba(16,185,129,0.35)", padding: "2px 8px", borderRadius: 999 }}>
+                  Policy-Equivalent Under Current Portfolio State
+                </span>
+              ) : null}
+              {versionMissing ? (
+                <span style={{ fontSize: 12, color: "#b45f00", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.35)", padding: "2px 8px", borderRadius: 999 }}>
+                  Allocator version unavailable in run payload
+                </span>
+              ) : null}
+            </div>
+          </summary>
+          <div style={{ color: "#888", fontSize: 12, marginTop: 6 }}>
+            Allocator: {activeVersion} • Policy: {activePolicyLabel} • Analyzer: {analyzerVersion ?? EM_DASH}
+          </div>
+          <div style={{ color: "#888", fontSize: 12, marginTop: 6 }}>{summary}</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, marginTop: 10, color: "#ddd", fontSize: 13 }}>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>ER mult</div>
+              <div style={{ fontWeight: 600 }}>{erMult === null ? "—" : erMult.toFixed(2)}</div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Vol mult</div>
+              <div style={{ fontWeight: 600 }}>{volMult === null ? "—" : volMult.toFixed(2)}</div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Risk scale</div>
+              <div style={{ fontWeight: 600 }}>{riskMult === null ? "—" : riskMult.toFixed(2)}</div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Correlation penalty</div>
+              <div style={{ fontWeight: 600 }}>{corrApplied === null ? "—" : corrApplied ? "applied" : "none"}</div>
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Liquidity penalty</div>
+              <div style={{ fontWeight: 600 }}>{liqApplied === null ? "—" : liqApplied ? "applied" : "none"}</div>
+            </div>
+          </div>
+          <div style={{ display: "grid", gap: 8, marginTop: 10, color: "#ddd", fontSize: 13 }}>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Active policy effects</div>
+              {!effectsAvailable ? (
+                <div style={{ color: "#aaa", fontSize: 12 }}>No policy-level effects computed for this run.</div>
+              ) : bindingFactors.length ? (
+                <ul style={{ margin: "4px 0 0 18px", padding: 0 }}>
+                  {bindingFactors.map((item, idx) => (
+                    <li key={`bind_${idx}`}>{item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <div style={{ color: "#aaa", fontSize: 12 }}>None</div>
+              )}
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Inactive policy knobs</div>
+              {!effectsAvailable ? (
+                <div style={{ color: "#aaa", fontSize: 12 }}>No policy-level effects computed for this run.</div>
+              ) : inactiveKnobReasons.length ? (
+                <ul style={{ margin: "4px 0 0 18px", padding: 0 }}>
+                  {inactiveKnobReasons.map((item, idx) => (
+                    <li key={`inactive_${idx}`}>{item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <div style={{ color: "#aaa", fontSize: 12 }}>None</div>
+              )}
+            </div>
+            <div>
+              <div style={{ color: "#888", fontSize: 12 }}>Role effects</div>
+              {!roleEffectsAvailable ? (
+                <div style={{ color: "#aaa", fontSize: 12 }}>Role effects unavailable for this run.</div>
+              ) : roleSummary.length ? (
+                <ul style={{ margin: "4px 0 0 18px", padding: 0 }}>
+                  {roleSummary.map((item, idx) => (
+                    <li key={`role_${idx}`}>{item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <div style={{ color: "#aaa", fontSize: 12 }}>No role-level effects observed under current conditions.</div>
+              )}
+            </div>
+            {effectsAvailable && divergenceConditions.length ? (
+              <details style={{ marginTop: 6 }}>
+                <summary style={{ cursor: "pointer" }}>Show conditions where policies would diverge</summary>
+                <ul style={{ margin: "6px 0 0 18px", padding: 0, color: "#aaa", fontSize: 12 }}>
+                  {divergenceConditions.map((item, idx) => (
+                    <li key={`div_${idx}`}>{item}</li>
+                  ))}
+                </ul>
+              </details>
+            ) : null}
+          </div>
+          {notes.length ? (
+            <ul style={{ marginTop: 10, marginBottom: 0, paddingLeft: 18, color: "#aaa", fontSize: 12 }}>
+              {notes.map((note, idx) => (
+                <li key={`policy_note_${idx}`}>{note}</li>
+              ))}
+            </ul>
+          ) : null}
+        </details>
+      );
+    },
+    [getPolicyEffectsFromTick, getRoleEffectsFromTick, getPolicySensitivityFromTick, getPolicyEquivalenceFromTick]
+  );
+
+  const renderExplainPayload = useCallback((payload: unknown) => {
+    if (!payload || typeof payload !== "object") {
+      return <div style={{ color: "#666" }}>No explanation payload.</div>;
+    }
+    const expl = payload as Record<string, unknown>;
+    const summary = typeof expl["summary"] === "string" ? (expl["summary"] as string) : "AI explanation unavailable.";
+    const rationale = Array.isArray(expl["rationale_bullets"]) ? (expl["rationale_bullets"] as string[]) : [];
+    const riskNotes = Array.isArray(expl["risk_notes"]) ? (expl["risk_notes"] as string[]) : [];
+    const confidence = typeof expl["confidence"] === "string" ? (expl["confidence"] as string) : "low";
+    const meta = expl["meta"];
+    const metaObj = meta && typeof meta === "object" ? (meta as Record<string, unknown>) : null;
+    const metaEnabled = metaObj && typeof metaObj["enabled"] === "boolean" ? String(metaObj["enabled"]) : null;
+    const metaStatus = metaObj && typeof metaObj["status"] === "string" ? (metaObj["status"] as string) : null;
+    const metaError = metaObj && typeof metaObj["error"] === "string" ? (metaObj["error"] as string) : null;
+
+    return (
+      <div style={{ display: "grid", gap: 10 }}>
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Summary</div>
+          <div style={{ color: "#111", lineHeight: 1.4 }}>{summary}</div>
+        </div>
+
+        {rationale.length ? (
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>Rationale</div>
+            <ul style={{ margin: "0 0 0 18px", padding: 0 }}>
+              {rationale.map((item, idx) => (
+                <li key={`r_${idx}`} style={{ marginBottom: 4 }}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {riskNotes.length ? (
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>Risk Notes</div>
+            <ul style={{ margin: "0 0 0 18px", padding: 0 }}>
+              {riskNotes.map((item, idx) => (
+                <li key={`rn_${idx}`} style={{ marginBottom: 4 }}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, color: "#444", fontSize: 12 }}>
+          <div>confidence: {confidence}</div>
+          {metaEnabled ? <div>enabled: {metaEnabled}</div> : null}
+          {metaStatus ? <div>status: {metaStatus}</div> : null}
+          {metaError ? <div>error: {metaError}</div> : null}
+        </div>
+      </div>
+    );
+  }, []);
+
+  const renderScorecard = useCallback((scorecard: Record<string, unknown> | undefined) => {
+    const val = (key: string) => scorecard && typeof scorecard[key] === "number" ? (scorecard[key] as number) : null;
+    const fmt = (v: number | null, digits = 2) => (v === null ? "—" : v.toFixed(digits));
+    const fmtPct = (v: number | null) => (v === null ? "—" : `${v.toFixed(2)}%`);
+    return (
+      <div style={{ display: "grid", gap: 6, color: "#ddd", fontSize: 13 }}>
+        <div>Average churn: {fmtPct(val("avg_churn_pct"))}</div>
+        <div>Max churn: {fmtPct(val("max_churn_pct"))}</div>
+        <div>Average risk delta: {fmt(val("avg_risk_delta"), 4)}</div>
+        <div>Cumulative turnover (L1): {fmt(val("cumulative_turnover_l1"), 4)}</div>
+        <div>Pruning events: {fmt(val("pruning_events_count"), 0)}</div>
+        <div>Constraint bind count: {fmt(val("constraint_bind_count"), 0)}</div>
+      </div>
+    );
   }, []);
 
   // NEW: small helper for safe tick id reads (avoid `any`)
@@ -1324,18 +2488,6 @@ export default function Page() {
     const rec = v as Record<string, unknown>;
     return typeof rec["tick_id"] === "string" ? (rec["tick_id"] as string) : "";
   }, []);
-
-  // NEW: small reader for the labels when rendering
-  const getTickContextLabel = useCallback(
-    (t: Tick, kind: "portfolio" | "policy"): string => {
-      const rec = (t as unknown as Record<string, unknown>)["_ui_context"];
-      if (!rec || typeof rec !== "object") return kind === "portfolio" ? "(current)" : "(unsaved)";
-      const ctx = rec as Record<string, unknown>;
-      const key = kind === "portfolio" ? "portfolioLabel" : "policyLabel";
-      return typeof ctx[key] === "string" && ctx[key] ? (ctx[key] as string) : kind === "portfolio" ? "(current)" : "(unsaved)";
-    },
-    []
-  );
 
   // MOVE UP: define before runOneOffPolicyTick uses it
   const pickOutgoingRegimeForPolicy = useCallback(
@@ -1346,6 +2498,31 @@ export default function Page() {
       return pickOutgoingRegime(schemaV, (policy.regime ?? {}) as Record<string, unknown>);
     },
     []
+  );
+
+  const buildPolicySnapshotForSimulation = useCallback(
+    (policy: AllocationPolicy | null): Record<string, unknown> => {
+      if (policy) {
+        return {
+          id: policy.id,
+          name: policy.name,
+          allocator_version: policy.allocatorVersion === "default" ? "v1" : policy.allocatorVersion,
+          constraints: policy.constraints ?? {},
+          regime: pickOutgoingRegimeForPolicy(policy),
+          risk_posture: riskPosture,
+        };
+      }
+      const schemaV: SchemaAllocatorVersion = allocatorVersion === "default" ? "v1" : (allocatorVersion as SchemaAllocatorVersion);
+      return {
+        id: selectedPolicyId || null,
+        name: policyNameDraft || "(unsaved)",
+        allocator_version: allocatorVersion === "default" ? "v1" : allocatorVersion,
+        constraints: constraintsDraft ?? {},
+        regime: pickOutgoingRegime(schemaV, (regimeDraft ?? {}) as Record<string, unknown>),
+        risk_posture: riskPosture,
+      };
+    },
+    [allocatorVersion, constraintsDraft, policyNameDraft, pickOutgoingRegimeForPolicy, regimeDraft, selectedPolicyId, riskPosture]
   );
 
   // CHANGE: ticksForTable should return ALL results (no slicing)
@@ -1372,6 +2549,11 @@ export default function Page() {
     return deduped;
   }, [ticks, scenario?.last_tick, latestTick, hiddenTickIds, getTickIdSafe]);
 
+  const simTicksA = simResult?.results?.A?.ticks ?? [];
+  const simTicksB = simResult?.results?.B?.ticks ?? [];
+  const simActiveTicks = simSelectedTrack === "B" && simTicksB.length ? simTicksB : simTicksA;
+  const simActiveTick = simActiveTicks[simSelectedTickIndex] ?? null;
+
   // NEW: ensure latest is expanded by default; older remain collapsed.
   // Runs whenever list changes, unless user already toggled.
   useEffect(() => {
@@ -1383,6 +2565,27 @@ export default function Page() {
     setExpandedTickIds(new Set([latest.tick_id]));
     setExpandedExplainIds(new Set());
   }, [tickUiTouched, ticksForTable]);
+
+  useEffect(() => {
+    if (abUiTouched) return;
+    if (!abResults.length) return;
+    const latest = abResults[0];
+    if (!latest?.runId) return;
+    setExpandedAbRunIds(new Set([latest.runId]));
+  }, [abResults, abUiTouched]);
+
+  const toggleAbRunExpanded = useCallback((runId: string) => {
+    setAbUiTouched(true);
+    setExpandedAbRunIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(runId)) {
+        next.delete(runId);
+      } else {
+        next.add(runId);
+      }
+      return next;
+    });
+  }, []);
 
   // NEW/RESTORE: single stable handler (do not declare inside .map)
   const onLoadAllocationIntoPortfolio = useCallback(
@@ -1468,6 +2671,54 @@ export default function Page() {
     else window.localStorage.removeItem(POLICY_B_SELECTED_KEY);
   }, [selectedPolicyBId]);
 
+  const onRunSimulation = useCallback(async () => {
+    if (!scenarioId) return;
+    if (!portfolioDraft) {
+      setMessage("Portfolio missing.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const policyARef = selectedPolicyAId ? policies.find((p) => p.id === selectedPolicyAId) ?? null : null;
+      const policyBRef = selectedPolicyBId ? policies.find((p) => p.id === selectedPolicyBId) ?? null : null;
+      const policyA = buildPolicySnapshotForSimulation(policyARef);
+      const policyB = policyBRef ? buildPolicySnapshotForSimulation(policyBRef) : null;
+      const payload = {
+        decision_type: "simulation",
+        portfolio_snapshot: portfolioDraft,
+        policy_a_snapshot: policyA,
+        ...(policyB ? { policy_b_snapshot: policyB } : {}),
+        simulation_config: {
+          tick_count: simTickCount,
+          seed: simSeed,
+          persistence: simPersistence,
+          risk_class_regimes: simRiskClassRegimes,
+        },
+      };
+      const created = (await simRun(scenarioId, payload)) as SimulationResult;
+      setSimResult(created);
+      setSimSelectedTickIndex(0);
+      setSimSelectedTrack("A");
+      setMessage("Simulation complete.");
+    } catch (e) {
+      console.error("Simulation run failed:", e);
+      setMessage(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    scenarioId,
+    portfolioDraft,
+    selectedPolicyAId,
+    selectedPolicyBId,
+    policies,
+    buildPolicySnapshotForSimulation,
+    simTickCount,
+    simSeed,
+    simPersistence,
+    simRiskClassRegimes,
+  ]);
+
   // NEW: resolve selected policies (snapshotted at run time)
   const selectedPolicyA = useMemo(() => policies.find((p) => p.id === selectedPolicyAId) ?? null, [policies, selectedPolicyAId]);
   const selectedPolicyB = useMemo(() => policies.find((p) => p.id === selectedPolicyBId) ?? null, [policies, selectedPolicyBId]);
@@ -1475,14 +2726,23 @@ export default function Page() {
   // NEW: UI-only display mapping (policy may store "default", but default resolves to v1)
   const displayAllocatorVersion = useCallback((v?: string | null) => {
     const s = String(v ?? "").trim();
-    return s === "default" ? "v1" : (s || "—");
+    return s === "default" ? "v1" : (s || EM_DASH);
   }, []);
 
   const allocatorVersionsDiffer = useMemo(() => {
     const a = displayAllocatorVersion(selectedPolicyA?.allocatorVersion || "");
     const b = displayAllocatorVersion(selectedPolicyB?.allocatorVersion || "");
-    return a !== "—" && b !== "—" && a !== b;
+    return a !== EM_DASH && b !== EM_DASH && a !== b;
   }, [selectedPolicyA?.allocatorVersion, selectedPolicyB?.allocatorVersion, displayAllocatorVersion]);
+  const simAllocatorVersionsDiffer = useMemo(() => {
+    if (!selectedPolicyBId) return false;
+    const a = displayAllocatorVersion(
+      selectedPolicyAId ? (selectedPolicyA?.allocatorVersion || "") : (allocatorVersion || "")
+    );
+    const b = displayAllocatorVersion(selectedPolicyB?.allocatorVersion || "");
+    return a !== EM_DASH && b !== EM_DASH && a !== b;
+  }, [allocatorVersion, selectedPolicyAId, selectedPolicyBId, selectedPolicyA?.allocatorVersion, selectedPolicyB?.allocatorVersion, displayAllocatorVersion]);
+
 
   // NEW: normalize createScenario return (reused)
   const parseScenarioIdFromCreate = useCallback((created: unknown): string | null => {
@@ -1497,10 +2757,10 @@ export default function Page() {
   // - uses only existing endpoints (createScenario, putPortfolio/Constraints/Regime/Inflow, runTick)
   // - exactly one tick
   // - does NOT affect main scenario/ticks
-  const runOneOffPolicyTick = useCallback(
-    async (policy: AllocationPolicy): Promise<Tick> => {
-      const pf = portfolioDraft ?? { assets: [] };
-      const inflow = inflowDraft ?? null;
+    const runOneOffPolicyTick = useCallback(
+      async (policy: AllocationPolicy): Promise<Tick> => {
+        const pf = portfolioDraft ?? { assets: [] };
+        const inflow = inflowDraft ?? null;
 
       const constraintsToUse: Constraints = policy.constraints ?? {};
 
@@ -1511,12 +2771,20 @@ export default function Page() {
       const tempScenarioId = parseScenarioIdFromCreate(created);
       if (!tempScenarioId) throw new Error("createScenario did not return a scenario id");
 
+      const allocatorToUse = policy.allocatorVersion === "default" ? "v1" : policy.allocatorVersion;
+
       await putPortfolio(tempScenarioId, pf);
       await putConstraints(tempScenarioId, constraintsToUse);
+      await putAllocatorVersion(tempScenarioId, allocatorToUse);
       await putRegime(tempScenarioId, regimeToUse);
       if (inflow !== null) await putInflow(tempScenarioId, { capital_inflow_amount: Number(inflow ?? 0) });
 
-      const createdTickUnknown: unknown = await runTick(tempScenarioId);
+        const createdTickUnknown: unknown = await runTick(tempScenarioId, {
+          decision_type: runDecisionType,
+          allocator_version: allocatorToUse,
+          policy_id: policy.id,
+          policy_name: policy.name,
+        });
 
       let createdTick: Tick | null = normalizeTickForList(
         createdTickUnknown && typeof createdTickUnknown === "object" ? (createdTickUnknown as Tick) : null
@@ -1527,7 +2795,7 @@ export default function Page() {
       if (!createdTick) throw new Error("runTick did not return a usable tick/decision payload");
       return createdTick;
     },
-    [portfolioDraft, inflowDraft, parseScenarioIdFromCreate, makeSyntheticTickFromDecision, pickOutgoingRegimeForPolicy]
+    [portfolioDraft, inflowDraft, parseScenarioIdFromCreate, makeSyntheticTickFromDecision, pickOutgoingRegimeForPolicy, runDecisionType]
   );
 
   // NEW: Run A/B comparison (exactly one tick per side; no simRun; no touching ticks[])
@@ -1698,7 +2966,7 @@ export default function Page() {
       {/* Header stays outside cards */}
       <header style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <strong style={{ color: "#fff" }}>Sagitta AAA</strong>
+          <Image src="/logo.png" alt="Sagitta AAA logo" width={50} height={50} priority />
         </div>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
           <button
@@ -1718,7 +2986,7 @@ export default function Page() {
       </header>
 
       {/* NEW: render me info (if present) to help confirm sqlite upsert and authority */}
-      <div style={{ margin: "8px 0", padding: 8, borderRadius: 8, background: "#0b1220", color: "#cbe8ff" }}>
+      <div style={{ margin: "8px 0", padding: 8, borderRadius: 8, background: "#0b1220", color: "#cbe8ff", display: "none" }}>
         <strong>User info (from /api/aaa/me):</strong>
         <div style={{ marginTop: 6, fontSize: 13, color: "#9fbdd8" }}>
           {meError ? (
@@ -1794,12 +3062,12 @@ export default function Page() {
                 <option value="">(Saved portfolios)</option>
                 {savedPortfolios.map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} — {new Date(p.updatedAt).toLocaleString()}
+                    {p.name} {EM_DASH} {new Date(p.updatedAt).toLocaleString()}
                   </option>
                 ))}
               </select>
 
-              <button onClick={importPortfolioFromJson} disabled={loading}>
+              <button onClick={onOpenImportModal} disabled={loading}>
                 Import
               </button>
               <button onClick={clearPortfolio} disabled={loading}>
@@ -1816,7 +3084,17 @@ export default function Page() {
 
           {/* NEW: Portfolio table + inline add row */}
           <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <table className="portfolio-table" style={{ width: "100%" }}>
+              <colgroup>
+                <col style={{ width: "6%" }} />
+                <col style={{ width: "19%" }} />
+                <col style={{ width: "20%" }} />
+                <col style={{ width: "12%" }} />
+                <col style={{ width: "12%" }} />
+                <col style={{ width: "10%" }} />
+                <col style={{ width: "9%" }} />
+                <col style={{ width: "12%" }} />
+              </colgroup>
               <thead>
                 <tr>
                   <th style={{ textAlign: "left", color: "#fff" }}>
@@ -1847,6 +3125,16 @@ export default function Page() {
                       tabIndex={0}
                     >
                       {humanizeLabel("risk_class")}
+                    </span>
+                  </th>
+                  <th style={{ textAlign: "left", color: "#fff" }}>
+                    <span
+                      className="tooltip"
+                      data-tooltip={PORTFOLIO_HEADER_TOOLTIPS["role"]}
+                      aria-label={PORTFOLIO_HEADER_TOOLTIPS["role"]}
+                      tabIndex={0}
+                    >
+                      {humanizeLabel("role")}
                     </span>
                   </th>
                   <th style={{ textAlign: "left", color: "#fff" }}>
@@ -1902,6 +3190,9 @@ export default function Page() {
                         <option value="stablecoin">{humanizeOption("stablecoin")}</option>
                         <option value="large_cap_crypto">{humanizeOption("large_cap_crypto")}</option>
                         <option value="defi_bluechip">{humanizeOption("defi_bluechip")}</option>
+                        <option value="large_cap_equity_core">{humanizeOption("large_cap_equity_core")}</option>
+                        <option value="defensive_equity">{humanizeOption("defensive_equity")}</option>
+                        <option value="growth_high_beta_equity">{humanizeOption("growth_high_beta_equity")}</option>
                         <option value="high_risk">{humanizeOption("high_risk")}</option>
                         <option value="equity_fund">{humanizeOption("equity_fund")}</option>
                         <option value="fixed_income">{humanizeOption("fixed_income")}</option>
@@ -1922,9 +3213,23 @@ export default function Page() {
                       </select>
                     </td>
                     <td>
+                      <select
+                        value={(a.role ?? "satellite") as string}
+                        onChange={(e) => onAssetChange(idx, { role: e.target.value as AssetRole })}
+                      >
+                        {ROLE_OPTIONS.map((opt) => (
+                          <option key={`role_${opt}`} value={opt}>
+                            {humanizeOption(opt)}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td>
                       <input
                         type="number"
                         step="0.01"
+                        min={0}
+                        max={1}
                         value={Number.isFinite(a.current_weight) ? a.current_weight : 0}
                         onChange={(e) => onAssetChange(idx, { current_weight: Number(e.target.value) })}
                       />
@@ -1953,7 +3258,7 @@ export default function Page() {
                   </tr>
                 ))}
 
-                <tr><td colSpan={7}>&nbsp;</td></tr>
+                <tr><td colSpan={8}>&nbsp;</td></tr>
 
                 {/* Inline add row */}
                 <tr>
@@ -1980,6 +3285,9 @@ export default function Page() {
                       <option value="stablecoin">{humanizeOption("stablecoin")}</option>
                       <option value="large_cap_crypto">{humanizeOption("large_cap_crypto")}</option>
                       <option value="defi_bluechip">{humanizeOption("defi_bluechip")}</option>
+                      <option value="large_cap_equity_core">{humanizeOption("large_cap_equity_core")}</option>
+                      <option value="defensive_equity">{humanizeOption("defensive_equity")}</option>
+                      <option value="growth_high_beta_equity">{humanizeOption("growth_high_beta_equity")}</option>
                       <option value="high_risk">{humanizeOption("high_risk")}</option>
                       <option value="equity_fund">{humanizeOption("equity_fund")}</option>
                       <option value="fixed_income">{humanizeOption("fixed_income")}</option>
@@ -2000,9 +3308,23 @@ export default function Page() {
                     </select>
                   </td>
                   <td>
+                    <select
+                      value={newAssetDraft.role}
+                      onChange={(e) => setNewAssetDraft((s) => ({ ...s, role: e.target.value as AssetRole }))}
+                    >
+                      {ROLE_OPTIONS.map((opt) => (
+                        <option key={`role_new_${opt}`} value={opt}>
+                          {humanizeOption(opt)}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
                     <input
                       type="number"
                       step="0.01"
+                      min={0}
+                      max={1}
                       value={newAssetDraft.current_weight}
                       onChange={(e) => setNewAssetDraft((s) => ({ ...s, current_weight: e.target.value }))}
                       placeholder="0.00"
@@ -2059,7 +3381,7 @@ export default function Page() {
                 <option value="">(Unsaved Policy)</option>
                 {policies.map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} — {new Date(p.updatedAt).toLocaleString()}
+                    {p.name} {EM_DASH} {new Date(p.updatedAt).toLocaleString()}
                   </option>
                 ))}
               </select>
@@ -2144,8 +3466,10 @@ export default function Page() {
                     max={1}
                     value={(constraintsDraft?.min_asset_weight ?? "") as number | ""}
                     onChange={(e) => {
-                      const v = e.target.value === "" ? undefined : Number(e.target.value);
-                      setConstraintsDraft((c) => ({ ...(c ?? {}), min_asset_weight: v }));
+                      if (e.target.value === "") return;
+                      const v = Number(e.target.value);
+                      if (!Number.isFinite(v)) return;
+                      setConstraintsDraft((c) => normalizeConstraintsAfterEdit(c, "min_asset_weight", v));
                       setConstraintsTouched(true);
                     }}
                     style={{ marginLeft: 8 }}
@@ -2180,8 +3504,10 @@ export default function Page() {
                     max={1}
                     value={(constraintsDraft?.max_asset_weight ?? "") as number | ""}
                     onChange={(e) => {
-                      const v = e.target.value === "" ? undefined : Number(e.target.value);
-                      setConstraintsDraft((c) => ({ ...(c ?? {}), max_asset_weight: v }));
+                      if (e.target.value === "") return;
+                      const v = Number(e.target.value);
+                      if (!Number.isFinite(v)) return;
+                      setConstraintsDraft((c) => normalizeConstraintsAfterEdit(c, "max_asset_weight", v));
                       setConstraintsTouched(true);
                     }}
                     style={{ marginLeft: 8 }}
@@ -2216,8 +3542,10 @@ export default function Page() {
                     max={1}
                     value={(constraintsDraft?.max_concentration ?? "") as number | ""}
                     onChange={(e) => {
-                      const v = e.target.value === "" ? undefined : Number(e.target.value);
-                      setConstraintsDraft((c) => ({ ...(c ?? {}), max_concentration: v }));
+                      if (e.target.value === "") return;
+                      const v = Number(e.target.value);
+                      if (!Number.isFinite(v)) return;
+                      setConstraintsDraft((c) => normalizeConstraintsAfterEdit(c, "max_concentration", v));
                       setConstraintsTouched(true);
                     }}
                     style={{ marginLeft: 8 }}
@@ -2225,9 +3553,12 @@ export default function Page() {
                 </label>
 
                 <small>
-                  {constraintsAutosave.status === "saving" && "Saving…"}
+                  {constraintsAutosave.status === "saving" && "Saving..."}
                   {constraintsAutosave.status === "saved" && "Saved"}
                   {constraintsAutosave.status === "error" && `Error: ${constraintsAutosave.errorMsg ?? "save failed"}`}
+                  {constraintsAutosave.status === "invalid" && constraintsTouched && constraintsValidationError
+                    ? `Error: ${constraintsValidationError}`
+                    : ""}
                 </small>
               </div>
             </div>
@@ -2245,17 +3576,21 @@ export default function Page() {
                 <small style={{ color: "#666" }}>Version: {selectedAllocatorSchemaVersion}</small>
               </div>
 
-              {/* CHANGE: two-column layout for regime fields */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(2, minmax(240px, 1fr))",
-                  gap: 14,
-                  alignItems: "start",
-                }}
-              >
-                {(REGIME_FIELDS_BY_ALLOCATOR[selectedAllocatorSchemaVersion] ?? []).map((f) => {
-                  const v = (regimeDraft ?? {})[f.key];
+              {selectedAllocatorSchemaVersion === "v1" ? (
+                <div style={{ color: "#666", fontSize: 13 }}>
+                  Regime inputs are ignored by v1. Switch allocator version to edit Decision Context fields.
+                </div>
+              ) : (
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(2, minmax(240px, 1fr))",
+                    gap: 14,
+                    alignItems: "start",
+                  }}
+                >
+                  {(REGIME_FIELDS_BY_ALLOCATOR[selectedAllocatorSchemaVersion] ?? []).map((f) => {
+                    const v = (regimeDraft ?? {})[f.key];
 
                   if (f.input === "select") {
                     const safe = sanitizeSelect(v, f.options, f.defaultValue);
@@ -2393,9 +3728,10 @@ export default function Page() {
                     );
                   }
 
-                  return null;
-                })}
-              </div>
+                    return null;
+                  })}
+                </div>
+              )}
 
               {/* keep autosave status below the grid */}
               <small style={{ display: "block", marginTop: 10 }}>
@@ -2415,38 +3751,179 @@ export default function Page() {
           
           {/* CHANGE: accurate description */}
           <div style={{ color: "#666", fontSize: 13, marginBottom: 12 }}>
-            {analysisMode
-              ? "Compare two Allocation Policies (A vs B) on the same Portfolio using one deterministic tick per side."
-              : "Executes a protocol allocation tick and returns target_weights for the next allocation."}
+            {runDecisionType === "simulation"
+              ? "Simulation Mode: This illustrates policy behavior over sequential ticks under assumed risk-class regimes. It does not model real prices or performance."
+              : analysisMode
+                ? "Compare two Allocation Policies (A vs B) on the same Portfolio using one deterministic tick per side."
+                : "Executes a protocol allocation tick and returns target_weights for the next allocation."}
           </div>
           <hr style={styles.hr} />
           {/* CHANGE: put Analysis Mode toggle on the Decision Type row */}
           <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
             <div>
               <label>
-                Decision Type (fixed):
-                <input value="Portfolio Allocation" readOnly style={{ marginLeft: 8 }} />
+                Decision Type:
+                <select
+                  value={runDecisionType}
+                  onChange={(e) => setRunDecisionType(e.target.value as RunDecisionType)}
+                  disabled={loading || isCreating || analysisMode}
+                  style={{ marginLeft: 8 }}
+                >
+                  <option value="allocation">Portfolio Allocation</option>
+                  <option value="simulation">Simulation</option>
+                </select>
               </label>
             </div>
 
             {/* NEW: spacer pushes toggle to the right */}
             <div style={{ marginLeft: "auto" }} />
 
-            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span>Analysis A/B Mode</span>
-              <input
-                type="checkbox"
-                checked={analysisMode}
-                onChange={(e) => setAnalysisMode(e.target.checked)}
-                disabled={loading || isCreating}
-              />
-            </label>
+            {runDecisionType !== "simulation" ? (
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span>Analysis A/B Mode</span>
+                <input
+                  type="checkbox"
+                  checked={analysisMode}
+                  onChange={(e) => setAnalysisMode(e.target.checked)}
+                  disabled={loading || isCreating}
+                />
+              </label>
+            ) : null}
           </div>
+
+          {runDecisionType === "simulation" ? (
+            <div style={{ display: "grid", gap: 12, marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "center", width: "100%" }}>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                  <span>Tick count</span>
+                  <select
+                    value={simTickCount}
+                    onChange={(e) => setSimTickCount(Number(e.target.value))}
+                    disabled={loading}
+                    style={{ minWidth: 90 }}
+                  >
+                    <option value={5}>5</option>
+                    <option value={10}>10</option>
+                    <option value={25}>25</option>
+                    <option value={50}>50</option>
+                  </select>
+                </label>
+              </div>
+
+              <div
+                style={{
+                  background: "rgba(255,255,255,0.08)",
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  borderRadius: 10,
+                  padding: 12,
+                  boxShadow: "0 0 0 1px rgba(255,255,255,0.04) inset",
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Risk Class Regimes</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 8 }}>
+                  {simRiskClasses.map((rc) => (
+                    <label key={`sim_rc_${rc}`} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ minWidth: 120 }}>{humanizeOption(rc)}</span>
+                      <select
+                        value={simRiskClassRegimes[rc] || "sideways"}
+                        onChange={(e) =>
+                          setSimRiskClassRegimes((prev) => ({ ...prev, [rc]: e.target.value as SimRegime }))
+                        }
+                        disabled={loading}
+                      >
+                        <option value="bull">Bull</option>
+                        <option value="bear">Bear</option>
+                        <option value="sideways">Sideways</option>
+                        <option value="random">Random</option>
+                      </select>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, width: "50%", margin: "0 auto", paddingTop: 20 }}>
+                <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                    <strong>Policy A</strong>
+                  </div>
+
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>Policy name</div>
+                    <select
+                      value={selectedPolicyAId}
+                      onChange={(e) => setSelectedPolicyAId(e.target.value)}
+                      style={{ width: "100%" }}
+                      disabled={loading}
+                    >
+                      <option value="">(use current policy draft)</option>
+                      {policies.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} {EM_DASH} {p.allocatorVersion}
+                        </option>
+                      ))}
+                    </select>
+
+                    <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>
+                      allocator: {displayAllocatorVersion(selectedPolicyA?.allocatorVersion || allocatorVersion)}
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 8, padding: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                    <strong>Policy B</strong>
+                  </div>
+
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>Policy name</div>
+                    <select
+                      value={selectedPolicyBId}
+                      onChange={(e) => setSelectedPolicyBId(e.target.value)}
+                      style={{ width: "100%" }}
+                      disabled={loading}
+                    >
+                      <option value="">(none)</option>
+                      {policies.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} {EM_DASH} {p.allocatorVersion}
+                        </option>
+                      ))}
+                    </select>
+
+                    <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>
+                      allocator: {displayAllocatorVersion(selectedPolicyB?.allocatorVersion)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {simAllocatorVersionsDiffer ? (
+                <div
+                  style={{
+                    background: "rgba(245, 158, 11, 0.12)",
+                    border: "1px solid rgba(245, 158, 11, 0.35)",
+                    color: "#7a4a00",
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                    width: "50%",
+                    margin: "0 auto",
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>
+                    Different allocator authorities detected (A: {displayAllocatorVersion(selectedPolicyA?.allocatorVersion || allocatorVersion)}, B: {displayAllocatorVersion(selectedPolicyB?.allocatorVersion)})
+                  </div>
+                  <div style={{ fontSize: 12, marginTop: 4, opacity: 0.9 }}>
+                    Outcomes reflect differences in decision logic and enforcement scope.
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {/* CHANGE: this wrapper must not force horizontal layout in A/B mode */}
           <div
             style={
-              !analysisMode
+              !analysisMode && runDecisionType !== "simulation"
                 ? { display: "flex", justifyContent: "center", marginTop: 10 }
                 : {
                     display: "flex",
@@ -2457,7 +3934,11 @@ export default function Page() {
                   }
             }
           >
-            {!analysisMode ? (
+            {runDecisionType === "simulation" ? (
+              <button className="btn-primary" onClick={onRunSimulation} disabled={loading} style={{ minWidth: 320 }}>
+                Run Simulation
+              </button>
+            ) : !analysisMode ? (
               <button className="btn-primary" onClick={onRunTick} disabled={loading} style={{ minWidth: 320 }}>
                 Execute Allocation Decision
               </button>
@@ -2479,7 +3960,7 @@ export default function Page() {
                         <option value="">(Select saved policy)</option>
                         {policies.map((p) => (
                           <option key={p.id} value={p.id}>
-                            {p.name} — {p.allocatorVersion}
+                            {p.name} {EM_DASH} {p.allocatorVersion}
                           </option>
                         ))}
                       </select>
@@ -2505,7 +3986,7 @@ export default function Page() {
                         <option value="">(Select saved policy)</option>
                         {policies.map((p) => (
                           <option key={p.id} value={p.id}>
-                            {p.name} — {p.allocatorVersion}
+                            {p.name} {EM_DASH} {p.allocatorVersion}
                           </option>
                         ))}
                       </select>
@@ -2585,14 +4066,190 @@ export default function Page() {
         </section>
 
         <section style={styles.sectionCard}>
-          {/* Results: Decision Results or A/B Results */}
-          {!analysisMode ? (
+          {/* Results: Decision Results / Simulation Results / A/B Results */}
+          {runDecisionType === "simulation" ? (
             <>
               <section>
-                <h2>Decision Results</h2>
+                <h2>Simulation Results</h2>
+                <hr style={styles.hr} />
+                {!simResult ? (
+                  <div style={{ color: "#666", fontSize: 13 }}>No simulation results yet. Click Run Simulation.</div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      {simResult.regime_sequence.map((s) => (
+                        <button
+                          key={`sim_tick_${s.tick_index}`}
+                          onClick={() => setSimSelectedTickIndex(s.tick_index)}
+                          disabled={loading}
+                          style={{
+                            padding: "4px 8px",
+                            borderRadius: 6,
+                            border: "1px solid rgba(0,0,0,0.15)",
+                            background: s.tick_index === simSelectedTickIndex ? "#1b7f3a" : "#222",
+                            color: s.tick_index === simSelectedTickIndex ? "#fff" : "#ddd",
+                          }}
+                        >
+                          {s.tick_index}
+                        </button>
+                      ))}
+                    </div>
+
+                    {simResult.results.B ? (
+                      <div style={{ display: "flex", gap: 12 }}>
+                        <button
+                          onClick={() => setSimSelectedTrack("A")}
+                          disabled={loading}
+                          style={{ background: simSelectedTrack === "A" ? "#1b7f3a" : "#222", color: "#fff" }}
+                        >
+                          Policy A
+                        </button>
+                        <button
+                          onClick={() => setSimSelectedTrack("B")}
+                          disabled={loading}
+                          style={{ background: simSelectedTrack === "B" ? "#1b7f3a" : "#222", color: "#fff" }}
+                        >
+                          Policy B
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {simActiveTick ? (
+                      <div style={{ background: "#0c0c0c", padding: 12, borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)" }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 }}>
+                          <div>
+                            <div style={{ color: "#666", fontSize: 12 }}>Risk delta</div>
+                            <div style={{ fontWeight: 600 }}>
+                              {(() => {
+                                const riskSummary = (simActiveTick["risk_summary"] as Record<string, unknown> | undefined) ?? undefined;
+                                const deltaRaw =
+                                  riskSummary && typeof riskSummary === "object"
+                                    ? (riskSummary["delta"] as Record<string, unknown> | undefined)
+                                    : undefined;
+                                const delta =
+                                  deltaRaw && typeof deltaRaw === "object" && typeof deltaRaw["portfolio_volatility"] === "number"
+                                    ? (deltaRaw["portfolio_volatility"] as number)
+                                    : undefined;
+                                return typeof delta === "number" ? delta.toFixed(4) : EM_DASH;
+                              })()}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ color: "#666", fontSize: 12 }}>Churn %</div>
+                            <div style={{ fontWeight: 600 }}>
+                              {(() => {
+                                const stabilityMetrics = (simActiveTick["stability_metrics"] ?? null) as Record<string, unknown> | null;
+                                const rawChurn = stabilityMetrics && typeof stabilityMetrics === "object" ? stabilityMetrics["churn_pct"] : undefined;
+                                const churn = typeof rawChurn === "number" ? rawChurn : undefined;
+                                return typeof churn === "number" ? churn.toFixed(2) : EM_DASH;
+                              })()}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ color: "#666", fontSize: 12 }}>Max shift</div>
+                            <div style={{ fontWeight: 600 }}>
+                              {(() => {
+                                const stabilityMetrics = (simActiveTick["stability_metrics"] as Record<string, unknown> | undefined) ?? undefined;
+                                const maxShift =
+                                  stabilityMetrics && typeof stabilityMetrics === "object"
+                                    ? (stabilityMetrics as Record<string, unknown>)["max_asset_shift"]
+                                    : undefined;
+                                if (maxShift && typeof maxShift === "object") {
+                                  const asset = (maxShift as Record<string, unknown>)["asset"];
+                                  const delta = (maxShift as Record<string, unknown>)["delta"];
+                                  if (typeof asset === "string" && typeof delta === "number") return `${asset} (${delta.toFixed(3)})`;
+                                }
+                                return EM_DASH;
+                              })()}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div style={{ overflowX: "auto", marginTop: 12 }}>
+                          {(() => {
+                            const tw = extractTargetWeightsFromTick(simActiveTick);
+                            const prior = (simActiveTick as unknown as Record<string, unknown>)["prior_portfolio_weights"] as Record<string, number> | null;
+                            const { rows } = buildAllocationRowsFromPrior(prior, tw);
+                            return (
+                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                <thead>
+                                  <tr>
+                                    <th style={{ textAlign: "left", color: "#fff" }}>Asset</th>
+                                    <th style={{ textAlign: "left", color: "#fff" }}>Risk class</th>
+                                    <th style={{ textAlign: "left", color: "#fff" }}>Regime</th>
+                                    <th style={{ textAlign: "right", color: "#fff" }}>Prior tick</th>
+                                    <th style={{ textAlign: "right", color: "#fff" }}>Target</th>
+                                    <th style={{ textAlign: "right", color: "#fff" }}>Δ</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {(() => {
+                                    const assetRisk = new Map<string, string>();
+                                    for (const a of portfolioDraft?.assets ?? []) {
+                                      const id = String(a.id ?? "").trim();
+                                      if (!id) continue;
+                                      assetRisk.set(id, String(a.risk_class || "unknown"));
+                                    }
+                                    const simCtx = simActiveTick["simulation_context"] as SimulationContext | undefined;
+                                    const perClass = simCtx?.regime_for_tick || {};
+                                    return rows.map((r) => {
+                                      const rc = assetRisk.get(r.id) || "unknown";
+                                      const regime = (perClass as Record<string, string>)[rc] || "sideways";
+                                      const displayTgt = Math.abs(r.tgt) < 0.0001 ? 0 : r.tgt;
+                                      const displayCur =
+                                        typeof r.cur === "number" ? (Math.abs(r.cur) < 0.0001 ? 0 : r.cur) : null;
+                                      const displayDelta =
+                                        typeof r.delta === "number" ? (Math.abs(r.delta) < 0.0001 ? 0 : r.delta) : null;
+                                      const deltaPos = typeof displayDelta === "number" ? displayDelta >= 0 : true;
+                                      return (
+                                        <tr key={`sim_${r.id}`}>
+                                          <td>{r.id}</td>
+                                          <td>{humanizeOption(rc)}</td>
+                                          <td>{humanizeOption(regime)}</td>
+                                          <td style={{ textAlign: "right" }}>
+                                            {displayCur === null ? "—" : `${(displayCur * 100).toFixed(2)}%`}
+                                          </td>
+                                          <td style={{ textAlign: "right" }}>{(displayTgt * 100).toFixed(2)}%</td>
+                                          <td style={{ textAlign: "right", color: deltaPos ? "#1b7f3a" : "#b12a2a" }}>
+                                            {displayDelta === null ? "—" : `${(displayDelta * 100).toFixed(2)}%`}
+                                          </td>
+                                        </tr>
+                                      );
+                                    });
+                                  })()}
+                                </tbody>
+                              </table>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ color: "#666", fontSize: 13 }}>No tick selected.</div>
+                    )}
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                      <div style={{ background: "#111", padding: 10, borderRadius: 8 }}>
+                        <div style={{ fontWeight: 600, marginBottom: 6 }}>Scorecard A</div>
+                        {renderScorecard(simResult.results.A.scorecard as Record<string, unknown>)}
+                      </div>
+                      {simResult.results.B ? (
+                        <div style={{ background: "#111", padding: 10, borderRadius: 8 }}>
+                          <div style={{ fontWeight: 600, marginBottom: 6 }}>Scorecard B</div>
+                          {renderScorecard(simResult.results.B.scorecard as Record<string, unknown>)}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                )}
+              </section>
+            </>
+          ) : !analysisMode ? (
+            <>
+              <section>
+                <h2>Allocation Results</h2>
                 <hr style={styles.hr} />
                 {ticksForTable.length === 0 ? (
-                  <div style={{ color: "#666", fontSize: 13 }}>No decision results yet. Click Execute Allocation Decision.</div>
+                  <div style={{ color: "#666", fontSize: 13 }}>No allocation results yet. Click Execute Allocation Decision.</div>
                 ) : (
                   <div style={{ overflowX: "auto" }}>
                     <table style={{ width: "100%", borderCollapse: "collapse" }}>
@@ -2609,9 +4266,23 @@ export default function Page() {
                       <tbody>
                         {ticksForTable.map((t) => {
                           const tw = extractTargetWeightsFromTick(t);
-                          const { rows, turnover } = buildAllocationRows(tw);
+                          const priorWeights = getPriorWeightsFromTick(t);
+                          const { rows } = buildAllocationRowsFromPrior(priorWeights, tw);
+                          const analysis = getAnalysisSummaryFromTick(t);
+                          const roleEffects = getRoleEffectsFromTick(t);
+                          const roleStatus =
+                            typeof roleEffects?.["status"] === "string" ? (roleEffects?.["status"] as string) : null;
+                          const dominanceLabel =
+                            roleStatus === "applied"
+                              ? "Core Dominance: Applied"
+                              : roleStatus === "blocked_by_constraints"
+                              ? "Core Dominance: Blocked"
+                              : null;
+                          const churnPct =
+                            analysis && typeof analysis["churn_pct"] === "number" ? (analysis["churn_pct"] as number) : null;
                           const expanded = !!t.tick_id && expandedTickIds.has(t.tick_id);
                           const explainOpen = !!t.tick_id && expandedExplainIds.has(t.tick_id);
+                          const explainPending = !!t.tick_id && explainPendingIds.has(t.tick_id);
 
                           return (
                             <React.Fragment key={t.tick_id || t.timestamp}>
@@ -2622,7 +4293,23 @@ export default function Page() {
                                 <td>
                                   {tw ? (
                                     <span>
-                                      {humanizeLabel("target_weights")}: {Object.keys(tw).length} assets • turnover {(turnover * 100).toFixed(2)}%
+                                      {humanizeLabel("target_weights")}: {Object.keys(tw).length} assets • churn{" "}
+                                      {churnPct === null ? "—" : `${churnPct.toFixed(2)}%`}
+                                      {dominanceLabel ? (
+                                        <span
+                                          style={{
+                                            marginLeft: 8,
+                                            fontSize: 12,
+                                            color: roleStatus === "blocked_by_constraints" ? "#b45f00" : "#2a7a3a",
+                                            background: roleStatus === "blocked_by_constraints" ? "rgba(245,158,11,0.12)" : "rgba(16,185,129,0.12)",
+                                            border: roleStatus === "blocked_by_constraints" ? "1px solid rgba(245,158,11,0.35)" : "1px solid rgba(16,185,129,0.35)",
+                                            padding: "2px 6px",
+                                            borderRadius: 999,
+                                          }}
+                                        >
+                                          {dominanceLabel}
+                                        </span>
+                                      ) : null}
                                     </span>
                                   ) : (
                                     <span style={{ color: "#666" }}>No {humanizeLabel("target_weights")} in payload</span>
@@ -2639,7 +4326,7 @@ export default function Page() {
                                     Delete
                                   </button>
                                   <button onClick={() => onToggleExplain(t)} disabled={loading} style={{ marginLeft: 8 }}>
-                                    Explain
+                                    {explainPending ? "Explaining..." : "Explain"}
                                   </button>
                                   <button onClick={() => onToggleExpandTick(t)} disabled={loading} style={{ marginLeft: 8 }}>
                                     {expanded ? "Hide" : "View"}
@@ -2647,17 +4334,11 @@ export default function Page() {
                                 </td>
                               </tr>
 
-                              {explainOpen ? (
-                                <tr>
-                                  <td colSpan={5}>
-                                    <div style={{ background: "#f8f8f8", padding: 8, color: "black" }}>
-                                      <pre style={{ margin: 0, overflow: "auto", maxHeight: 240 }}>
-                                        {JSON.stringify(getExplainPayloadFromTick(t), null, 2)}
-                                      </pre>
-                                    </div>
-                                  </td>
-                                </tr>
-                              ) : null}
+                              <tr>
+                                <td colSpan={5}>
+                                  {renderDecisionAnalysisStrip(t)}
+                                </td>
+                              </tr>
 
                               {expanded ? (
                                 <tr>
@@ -2665,12 +4346,31 @@ export default function Page() {
                                     {!tw ? (
                                       <div style={{ color: "#666", fontSize: 13 }}>No target_weights found for this tick.</div>
                                     ) : (
-                                      <div style={{ overflowX: "auto", backgroundColor: "#000000", padding: 10, borderRadius: 8, marginTop: 10 }}>
+                                      <div style={{ overflowX: "auto", backgroundColor: "#000000", padding: 10, borderRadius: 8, marginTop: 10, marginBottom: 10 }}>
+                                        {renderPolicyImpactSection(t)}
+                                        {explainOpen ? (
+                                          <div style={{ background: "#f8f8f8", padding: 10, color: "black", borderRadius: 8, marginBottom: 10 }}>
+                                            <div style={{ fontWeight: 600, marginBottom: 4 }}>Decision Explanation (LLM)</div>
+                                            <div style={{ fontSize: 12, color: "#666", marginBottom: 8 }}>
+                                              Narrative derived from deterministic analysis above.
+                                            </div>
+                                            {isPolicyEquivalentForTick(t) ? (
+                                              <div style={{ fontSize: 12, color: "#2a7a3a", marginBottom: 8 }}>
+                                                Policy-Equivalent Under Current Portfolio State
+                                              </div>
+                                            ) : null}
+                                            {renderExplainPayload(getExplainPayloadFromTick(t))}
+                                          </div>
+                                        ) : null}
+                                        <div style={{ fontWeight: 600, color: "#fff", marginBottom: 2 }}>Allocation Diff (Analyzer Output)</div>
+                                        <div style={{ color: "#aaa", fontSize: 12, marginBottom: 6 }}>
+                                          Target weights relative to the source portfolio.
+                                        </div>
                                         <table style={{ width: "100%", borderCollapse: "collapse" }}>
                                           <thead>
                                             <tr>
                                               <th style={{ textAlign: "left", color: "#fff" }}>Asset</th>
-                                              <th style={{ textAlign: "right", color: "#fff" }}>Current</th>
+                                              <th style={{ textAlign: "right", color: "#fff" }}>Source</th>
                                               <th style={{ textAlign: "right", color: "#fff" }}>Target</th>
                                               <th style={{ textAlign: "right", color: "#fff" }}>Δ</th>
                                               <th style={{ textAlign: "left", color: "#fff" }}>Visual</th>
@@ -2679,19 +4379,27 @@ export default function Page() {
                                           <tbody>
                                             {rows
                                               .slice()
-                                              .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+                                              .sort((a, b) => Math.abs(b.delta ?? 0) - Math.abs(a.delta ?? 0))
                                               .map((r) => {
+                                                const hasSource = typeof r.cur === "number";
                                                 const tgtPct = Math.max(0, Math.min(1, r.tgt));
-                                                const curPct = Math.max(0, Math.min(1, r.cur));
-                                                const deltaPos = r.delta >= 0;
+                                                const curPct = hasSource ? Math.max(0, Math.min(1, r.cur as number)) : null;
+                                                const displayTgt = Math.abs(tgtPct) < 0.0001 ? 0 : tgtPct;
+                                                const displayCur =
+                                                  curPct === null ? null : Math.abs(curPct) < 0.0001 ? 0 : curPct;
+                                                const displayDelta =
+                                                  typeof r.delta === "number" ? (Math.abs(r.delta) < 0.0001 ? 0 : r.delta) : null;
+                                                const deltaPos = typeof displayDelta === "number" ? displayDelta >= 0 : true;
 
                                                 return (
                                                   <tr key={r.id}>
                                                     <td>{r.id}</td>
-                                                    <td style={{ textAlign: "right" }}>{(curPct * 100).toFixed(2)}%</td>
-                                                    <td style={{ textAlign: "right" }}>{(tgtPct * 100).toFixed(2)}%</td>
+                                                    <td style={{ textAlign: "right" }}>
+                                                      {displayCur === null ? "—" : `${(displayCur * 100).toFixed(2)}%`}
+                                                    </td>
+                                                    <td style={{ textAlign: "right" }}>{(displayTgt * 100).toFixed(2)}%</td>
                                                     <td style={{ textAlign: "right", color: deltaPos ? "#1b7f3a" : "#b12a2a" }}>
-                                                      {(r.delta * 100).toFixed(2)}%
+                                                      {displayDelta === null ? "—" : `${(displayDelta * 100).toFixed(2)}%`}
                                                     </td>
                                                     <td style={{ minWidth: 260 }}>
                                                       <div
@@ -2708,24 +4416,26 @@ export default function Page() {
                                                             left: 0,
                                                             top: 0,
                                                             bottom: 0,
-                                                            width: `${tgtPct * 100}%`,
+                                                            width: `${displayTgt * 100}%`,
                                                             background: "rgba(11,42,111,0.85)",
                                                             borderRadius: 6,
                                                           }}
                                                         />
-                                                        <div
-                                                          title="current_weight marker"
-                                                          style={{
-                                                            position: "absolute",
-                                                            left: `${curPct * 100}%`,
-                                                            top: -2,
-                                                            width: 2,
-                                                            height: 14,
-                                                            background: "rgba(255,255,255,0.85)",
-                                                          }}
-                                                        />
+                                                        {displayCur === null ? null : (
+                                                          <div
+                                                            title="source portfolio marker"
+                                                            style={{
+                                                              position: "absolute",
+                                                              left: `${displayCur * 100}%`,
+                                                              top: -2,
+                                                              width: 2,
+                                                              height: 14,
+                                                              background: "rgba(255,255,255,0.85)",
+                                                            }}
+                                                          />
+                                                        )}
                                                       </div>
-                                                      <small style={{ color: "#666" }}>target bar (blue) • current marker (white)</small>
+                                                      <small style={{ color: "#666" }}>target bar (blue) • source portfolio marker (white)</small>
                                                     </td>
                                                   </tr>
                                                 );
@@ -2734,7 +4444,7 @@ export default function Page() {
                                         </table>
 
                                         <details style={{ marginTop: 10 }}>
-                                          <summary style={{ cursor: "pointer" }}>Raw tick JSON</summary>
+                                          <summary style={{ cursor: "pointer" }}>Raw tick (allocator + analyzer)</summary>
                                           <pre style={{ background: "#f8f8f8", padding: 8, color: "black", maxHeight: 300, overflow: "auto" }}>
                                             {JSON.stringify(t, null, 2)}
                                           </pre>
@@ -2765,9 +4475,14 @@ export default function Page() {
                     {abResults.map((r) => {
                       const twA = extractTargetWeightsFromTick(r.outputA);
                       const twB = extractTargetWeightsFromTick(r.outputB);
+                      const abDelta = computeWeightDeltaL1(twA, twB);
+                      const abEquivalent = typeof abDelta === "number" && abDelta <= 1e-6;
+                      const isExpanded = expandedAbRunIds.has(r.runId);
 
                       const A = buildAllocationRowsFromSnapshot(r.currentWeightsSnapshot, twA);
                       const B = buildAllocationRowsFromSnapshot(r.currentWeightsSnapshot, twB);
+                      const explainPendingA = !!r.outputA.tick_id && explainPendingIds.has(r.outputA.tick_id);
+                      const explainPendingB = !!r.outputB.tick_id && explainPendingIds.has(r.outputB.tick_id);
 
                       return (
                         <div key={r.runId} style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 10, padding: 12 }}>
@@ -2776,6 +4491,11 @@ export default function Page() {
                               <strong>Run:</strong> {r.runId}
                               <div style={{ color: "#666", fontSize: 12 }}>Created: {formatTs(r.createdAt)}</div>
                             </div>
+                            {abEquivalent ? (
+                              <div style={{ fontSize: 12, color: "#2a7a3a", background: "rgba(16,185,129,0.12)", border: "1px solid rgba(16,185,129,0.35)", padding: "4px 10px", borderRadius: 999 }}>
+                                Policy-Equivalent Under Current Portfolio State
+                              </div>
+                            ) : null}
                             {r.policyA.allocatorVersion !== r.policyB.allocatorVersion ? (
                               <div
                                 style={{
@@ -2799,9 +4519,18 @@ export default function Page() {
                                 version: {displayAllocatorVersion(r.policyA.allocatorVersion)}
                               </div>
                             )}
+                            <button
+                              onClick={() => toggleAbRunExpanded(r.runId)}
+                              aria-expanded={isExpanded}
+                              disabled={loading}
+                            >
+                              {isExpanded ? "Hide" : "View"}
+                            </button>
                           </div>
 
-                          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+                          {isExpanded ? (
+                            <>
+                              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
                             {/* Side A */}
                             <div style={{ border: "1px solid rgba(0,0,0,0.10)", borderRadius: 8, padding: 10 }}>
                               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
@@ -2818,7 +4547,12 @@ export default function Page() {
 
                               <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 10 }}>
                                 <button onClick={() => onExportTick(r.outputA)} disabled={loading}>Export</button>
-                                <button onClick={() => onToggleExplain(r.outputA)} disabled={loading}>Explain</button>
+                                <button onClick={() => onToggleExplain(r.outputA)} disabled={loading}>
+                                  {explainPendingA ? "Explaining..." : "Explain"}
+                                </button>
+                              </div>
+                              <div style={{ marginTop: 10 }}>
+                                {renderPolicyImpactSection(r.outputA)}
                               </div>
 
                               <div style={{ overflowX: "auto", marginTop: 10 }}>
@@ -2826,7 +4560,7 @@ export default function Page() {
                                   <thead>
                                     <tr>
                                       <th style={{ textAlign: "left", color: "#fff" }}>asset</th>
-                                      <th style={{ textAlign: "right", color: "#fff" }}>current</th>
+                                      <th style={{ textAlign: "right", color: "#fff" }}>source</th>
                                       <th style={{ textAlign: "right", color: "#fff" }}>target</th>
                                       <th style={{ textAlign: "right", color: "#fff" }}>Δ</th>
                                       <th style={{ textAlign: "left", color: "#fff" }}>visual</th>
@@ -2834,22 +4568,25 @@ export default function Page() {
                                   </thead>
                                   <tbody>
                                     {A.rows.map((row) => {
-                                      const tgtPct = Math.max(0, Math.min(1, row.tgt));
-                                      const curPct = Math.max(0, Math.min(1, row.cur));
-                                      const deltaPos = row.delta >= 0;
+                                        const tgtPct = Math.max(0, Math.min(1, row.tgt));
+                                        const curPct = Math.max(0, Math.min(1, row.cur));
+                                        const displayTgt = Math.abs(tgtPct) < 0.0001 ? 0 : tgtPct;
+                                        const displayCur = Math.abs(curPct) < 0.0001 ? 0 : curPct;
+                                        const displayDelta = Math.abs(row.delta) < 0.0001 ? 0 : row.delta;
+                                        const deltaPos = displayDelta >= 0;
 
                                       return (
                                         <tr key={`A_${r.runId}_${row.id}`}>
                                           <td>{row.id}</td>
-                                          <td style={{ textAlign: "right" }}>{(curPct * 100).toFixed(2)}%</td>
-                                          <td style={{ textAlign: "right" }}>{(tgtPct * 100).toFixed(2)}%</td>
+                                          <td style={{ textAlign: "right" }}>{(displayCur * 100).toFixed(2)}%</td>
+                                          <td style={{ textAlign: "right" }}>{(displayTgt * 100).toFixed(2)}%</td>
                                           <td style={{ textAlign: "right", color: deltaPos ? "#1b7f3a" : "#b12a2a" }}>
-                                            {(row.delta * 100).toFixed(2)}%
+                                            {(displayDelta * 100).toFixed(2)}%
                                           </td>
                                           <td style={{ minWidth: 220 }}>
                                             <div style={{ position: "relative", height: 10, background: "rgba(255,255,255,0.10)", borderRadius: 6 }}>
-                                              <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${tgtPct * 100}%`, background: "rgba(11,42,111,0.85)", borderRadius: 6 }} />
-                                              <div style={{ position: "absolute", left: `${curPct * 100}%`, top: -2, width: 2, height: 14, background: "rgba(255,255,255,0.85)" }} />
+                                              <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${displayTgt * 100}%`, background: "rgba(11,42,111,0.85)", borderRadius: 6 }} />
+                                              <div style={{ position: "absolute", left: `${displayCur * 100}%`, top: -2, width: 2, height: 14, background: "rgba(255,255,255,0.85)" }} />
                                             </div>
                                           </td>
                                         </tr>
@@ -2876,7 +4613,12 @@ export default function Page() {
 
                               <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 10 }}>
                                 <button onClick={() => onExportTick(r.outputB)} disabled={loading}>Export</button>
-                                <button onClick={() => onToggleExplain(r.outputB)} disabled={loading}>Explain</button>
+                                <button onClick={() => onToggleExplain(r.outputB)} disabled={loading}>
+                                  {explainPendingB ? "Explaining..." : "Explain"}
+                                </button>
+                              </div>
+                              <div style={{ marginTop: 10 }}>
+                                {renderPolicyImpactSection(r.outputB)}
                               </div>
 
                               <div style={{ overflowX: "auto", marginTop: 10 }}>
@@ -2884,7 +4626,7 @@ export default function Page() {
                                   <thead>
                                     <tr>
                                       <th style={{ textAlign: "left", color: "#fff" }}>asset</th>
-                                      <th style={{ textAlign: "right", color: "#fff" }}>current</th>
+                                      <th style={{ textAlign: "right", color: "#fff" }}>source</th>
                                       <th style={{ textAlign: "right", color: "#fff" }}>target</th>
                                       <th style={{ textAlign: "right", color: "#fff" }}>Δ</th>
                                       <th style={{ textAlign: "left", color: "#fff" }}>visual</th>
@@ -2892,22 +4634,25 @@ export default function Page() {
                                   </thead>
                                   <tbody>
                                     {B.rows.map((row) => {
-                                      const tgtPct = Math.max(0, Math.min(1, row.tgt));
-                                      const curPct = Math.max(0, Math.min(1, row.cur));
-                                      const deltaPos = row.delta >= 0;
+                                        const tgtPct = Math.max(0, Math.min(1, row.tgt));
+                                        const curPct = Math.max(0, Math.min(1, row.cur));
+                                        const displayTgt = Math.abs(tgtPct) < 0.0001 ? 0 : tgtPct;
+                                        const displayCur = Math.abs(curPct) < 0.0001 ? 0 : curPct;
+                                        const displayDelta = Math.abs(row.delta) < 0.0001 ? 0 : row.delta;
+                                        const deltaPos = displayDelta >= 0;
 
                                       return (
                                         <tr key={`B_${r.runId}_${row.id}`}>
                                           <td>{row.id}</td>
-                                          <td style={{ textAlign: "right" }}>{(curPct * 100).toFixed(2)}%</td>
-                                          <td style={{ textAlign: "right" }}>{(tgtPct * 100).toFixed(2)}%</td>
+                                          <td style={{ textAlign: "right" }}>{(displayCur * 100).toFixed(2)}%</td>
+                                          <td style={{ textAlign: "right" }}>{(displayTgt * 100).toFixed(2)}%</td>
                                           <td style={{ textAlign: "right", color: deltaPos ? "#1b7f3a" : "#b12a2a" }}>
-                                            {(row.delta * 100).toFixed(2)}%
+                                            {(displayDelta * 100).toFixed(2)}%
                                           </td>
                                           <td style={{ minWidth: 220 }}>
                                             <div style={{ position: "relative", height: 10, background: "rgba(255,255,255,0.10)", borderRadius: 6 }}>
-                                              <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${tgtPct * 100}%`, background: "rgba(11,42,111,0.85)", borderRadius: 6 }} />
-                                              <div style={{ position: "absolute", left: `${curPct * 100}%`, top: -2, width: 2, height: 14, background: "rgba(255,255,255,0.85)" }} />
+                                              <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${displayTgt * 100}%`, background: "rgba(11,42,111,0.85)", borderRadius: 6 }} />
+                                              <div style={{ position: "absolute", left: `${displayCur * 100}%`, top: -2, width: 2, height: 14, background: "rgba(255,255,255,0.85)" }} />
                                             </div>
                                           </td>
                                         </tr>
@@ -2922,19 +4667,35 @@ export default function Page() {
                           {/* Reuse existing explain payload renderer; uses existing toggle state keyed by tick_id */}
                           {expandedExplainIds.has(r.outputA.tick_id) ? (
                             <div style={{ marginTop: 10 }}>
-                              <strong>A Explain</strong>
-                              <pre style={{ background: "#f8f8f8", padding: 8, color: "black", maxHeight: 240, overflow: "auto" }}>
-                                {JSON.stringify(getExplainPayloadFromTick(r.outputA), null, 2)}
-                              </pre>
+                              <strong>Decision Explanation (LLM) — A</strong>
+                              <div style={{ fontSize: 12, color: "#666", margin: "4px 0 8px" }}>
+                                Narrative derived from deterministic analysis above.
+                              </div>
+                              {abEquivalent ? (
+                                <div style={{ fontSize: 12, color: "#2a7a3a", marginBottom: 8 }}>
+                                  Policy-Equivalent Under Current Portfolio State
+                                </div>
+                              ) : null}
+                              <div style={{ background: "#f8f8f8", padding: 8, color: "black" }}>
+                                {renderExplainPayload(getExplainPayloadFromTick(r.outputA))}
+                              </div>
                             </div>
                           ) : null}
 
                           {expandedExplainIds.has(r.outputB.tick_id) ? (
                             <div style={{ marginTop: 10 }}>
-                              <strong>B Explain</strong>
-                              <pre style={{ background: "#f8f8f8", padding: 8, color: "black", maxHeight: 240, overflow: "auto" }}>
-                                {JSON.stringify(getExplainPayloadFromTick(r.outputB), null, 2)}
-                              </pre>
+                              <strong>Decision Explanation (LLM) — B</strong>
+                              <div style={{ fontSize: 12, color: "#666", margin: "4px 0 8px" }}>
+                                Narrative derived from deterministic analysis above.
+                              </div>
+                              {abEquivalent ? (
+                                <div style={{ fontSize: 12, color: "#2a7a3a", marginBottom: 8 }}>
+                                  Policy-Equivalent Under Current Portfolio State
+                                </div>
+                              ) : null}
+                              <div style={{ background: "#f8f8f8", padding: 8, color: "black" }}>
+                                {renderExplainPayload(getExplainPayloadFromTick(r.outputB))}
+                              </div>
                             </div>
                           ) : null}
 
@@ -2945,6 +4706,8 @@ export default function Page() {
                                 {JSON.stringify(r.devRequests, null, 2)}
                               </pre>
                             </details>
+                          ) : null}
+                            </>
                           ) : null}
                         </div>
                       );
@@ -2964,6 +4727,232 @@ export default function Page() {
           {message ? <div style={{ color: "teal" }}>{message}</div> : <div style={{ color: "#666", fontSize: 13 }}>—</div>}
           <hr style={styles.hr} />
         </section>
+        {importModalOpen ? (
+          <div
+            style={{
+              position: "fixed",
+              inset: 0,
+              background: "rgba(0,0,0,0.65)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              zIndex: 50,
+              padding: 16,
+            }}
+          >
+            <div
+              style={{
+                background: "#0b0b0b",
+                border: "1px solid rgba(255,255,255,0.12)",
+                borderRadius: 12,
+                width: "min(980px, 96vw)",
+                maxHeight: "90vh",
+                overflowY: "auto",
+                padding: 16,
+                boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                <div>
+                  <h3 style={{ margin: 0 }}>Import Portfolio</h3>
+                  <div style={{ color: "#777", fontSize: 12 }}>Preview inferred weights and risk classes before applying.</div>
+                </div>
+                <button onClick={onCloseImportModal}>Close</button>
+              </div>
+
+              <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span>Connector</span>
+                  <select
+                    value={importConnectorId}
+                    onChange={(e) => {
+                      setImportConnectorId(e.target.value as ImportConnectorId);
+                      resetImportPreview();
+                    }}
+                    disabled={importPreviewLoading}
+                  >
+                    <option value="csv_v1">CSV (Brokerage Export)</option>
+                    <option value="json_v1">JSON (Positions)</option>
+                    <option value="wallet_evm_v1">Wallet (EVM)</option>
+                  </select>
+                </label>
+
+                {importConnectorId === "csv_v1" ? (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <div>
+                      <input
+                        type="file"
+                        accept=".csv,text/csv"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => setImportCsvText(String(reader.result || ""));
+                          reader.readAsText(file);
+                        }}
+                        disabled={importPreviewLoading}
+                      />
+                    </div>
+                    <textarea
+                      value={importCsvText}
+                      onChange={(e) => setImportCsvText(e.target.value)}
+                      placeholder="Paste CSV here"
+                      rows={6}
+                      style={{ width: "98%", fontFamily: "monospace" }}
+                    />
+                  </div>
+                ) : importConnectorId === "json_v1" ? (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <div>
+                      <input
+                        type="file"
+                        accept=".json,application/json,text/json"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => setImportJsonText(String(reader.result || ""));
+                          reader.readAsText(file);
+                        }}
+                        disabled={importPreviewLoading}
+                      />
+                    </div>
+                    <textarea
+                      value={importJsonText}
+                      onChange={(e) => setImportJsonText(e.target.value)}
+                      placeholder="Paste JSON array here"
+                      rows={6}
+                      style={{ width: "98%", fontFamily: "monospace" }}
+                    />
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span>Chain</span>
+                      <select
+                        value={importWalletChain}
+                        onChange={(e) => setImportWalletChain(e.target.value as "ethereum" | "polygon" | "arbitrum")}
+                        disabled={importPreviewLoading}
+                      >
+                        <option value="ethereum">Ethereum</option>
+                        <option value="polygon">Polygon</option>
+                        <option value="arbitrum">Arbitrum</option>
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span>Address</span>
+                      <input
+                        value={importWalletAddress}
+                        onChange={(e) => setImportWalletAddress(e.target.value)}
+                        placeholder="0x..."
+                        style={{ width: "100%" }}
+                        disabled={importPreviewLoading}
+                      />
+                    </label>
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <button onClick={onPreviewImport} disabled={importPreviewLoading}>
+                    {importPreviewLoading ? "Previewing..." : "Preview"}
+                  </button>
+                  {importPreview?.summary ? <span style={{ color: "#aaa", fontSize: 12 }}>{importPreview.summary}</span> : null}
+                </div>
+
+                {importPreviewError ? (
+                  <div style={{ color: "#ffb4b4", fontSize: 13 }}>Error: {importPreviewError}</div>
+                ) : null}
+
+                {importPreview?.warnings?.length ? (
+                  <div style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.35)", padding: 10, borderRadius: 8 }}>
+                    <div style={{ fontWeight: 600, color: "#d2a74a", marginBottom: 6 }}>Warnings</div>
+                    <ul style={{ margin: 0, paddingLeft: 18, color: "#caa85a" }}>
+                      {importPreview.warnings.map((w, idx) => (
+                        <li key={`warn_${idx}`}>{w.code}{w.detail ? ` - ${w.detail}` : ""}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {importPreview?.errors?.length ? (
+                  <div style={{ background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.35)", padding: 10, borderRadius: 8 }}>
+                    <div style={{ fontWeight: 600, color: "#ffb4b4", marginBottom: 6 }}>Errors</div>
+                    <ul style={{ margin: 0, paddingLeft: 18, color: "#ffb4b4" }}>
+                      {importPreview.errors.map((err, idx) => (
+                        <li key={`err_${idx}`}>{err}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {importPreviewAssets.length ? (
+                  <div style={{ border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: 10 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 6 }}>Preview</div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                        <thead>
+                          <tr>
+                            <th style={{ textAlign: "left", color: "#fff" }}>ID</th>
+                            <th style={{ textAlign: "left", color: "#fff" }}>Name</th>
+                            <th style={{ textAlign: "left", color: "#fff" }}>Risk class</th>
+                            <th style={{ textAlign: "left", color: "#fff" }}>Role</th>
+                            <th style={{ textAlign: "right", color: "#fff" }}>Weight</th>
+                            <th style={{ textAlign: "right", color: "#fff" }}>ER</th>
+                            <th style={{ textAlign: "right", color: "#fff" }}>Vol</th>
+                            <th style={{ textAlign: "right", color: "#fff" }}>Source value</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {importPreviewAssets.map((a, idx) => {
+                            const sourceValue = typeof a.source_value_usd === "number" ? a.source_value_usd : null;
+                            return (
+                            <tr key={`imp_${a.id}_${idx}`}>
+                              <td>{a.id}</td>
+                              <td>{a.name}</td>
+                              <td>
+                                <select
+                                  value={a.risk_class}
+                                  onChange={(e) => onUpdatePreviewRiskClass(idx, e.target.value)}
+                                >
+                                  {RISK_CLASS_OPTIONS.map((opt) => (
+                                    <option key={`rc_${opt}`} value={opt}>
+                                      {humanizeOption(opt || "(none)")}
+                                    </option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td>
+                                <select
+                                  value={a.role ?? "satellite"}
+                                  onChange={(e) => onUpdatePreviewRole(idx, e.target.value)}
+                                >
+                                  {ROLE_OPTIONS.map((opt) => (
+                                    <option key={`role_${opt}`} value={opt}>
+                                      {humanizeOption(opt)}
+                                    </option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td style={{ textAlign: "right" }}>{(a.current_weight * 100).toFixed(2)}%</td>
+                              <td style={{ textAlign: "right" }}>{a.expected_return.toFixed(2)}</td>
+                              <td style={{ textAlign: "right" }}>{a.volatility.toFixed(2)}</td>
+                              <td style={{ textAlign: "right" }}>{sourceValue === null ? "--" : sourceValue.toFixed(2)}</td>
+                            </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+                      <button onClick={onApplyImportToPortfolio}>Apply to Portfolio</button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -3000,4 +4989,3 @@ function normalizeTickForList(tick: Tick | null): Tick | null {
         : (tick as Tick).next_allocation_plan ?? null,
   };
 }
-

@@ -40,6 +40,13 @@ export async function putConstraints(scenario_id: string, constraints: unknown):
   });
 }
 
+export async function putAllocatorVersion(scenario_id: string, allocator_version: string): Promise<unknown> {
+  return req(`/scenario/${encodeURIComponent(scenario_id)}/allocator_version`, {
+    method: "PUT",
+    body: JSON.stringify({ allocator_version }),
+  });
+}
+
 export async function putInflow(scenario_id: string, inflow: { capital_inflow_amount: number }): Promise<unknown> {
   return req(`/scenario/${encodeURIComponent(scenario_id)}/inflow`, {
     method: "PUT",
@@ -47,12 +54,37 @@ export async function putInflow(scenario_id: string, inflow: { capital_inflow_am
   });
 }
 
-export async function runTick(scenario_id: string): Promise<unknown> {
-  return req(`/scenario/${encodeURIComponent(scenario_id)}/tick`, { method: "POST" });
+export async function runTick(scenario_id: string, body: Record<string, unknown> = {}): Promise<unknown> {
+  return req(`/scenario/${encodeURIComponent(scenario_id)}/tick`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function explainTick(scenario_id: string, tick_id: string): Promise<unknown> {
+  return req(
+    `/scenario/${encodeURIComponent(scenario_id)}/tick/${encodeURIComponent(tick_id)}/explain`,
+    { method: "POST" }
+  );
 }
 
 export async function getTicks(scenario_id: string): Promise<unknown> {
-  return req(`/scenario/${encodeURIComponent(scenario_id)}/ticks`);
+  const res = (await req(`/scenario/${encodeURIComponent(scenario_id)}/ticks`)) as unknown;
+  if (res && typeof res === "object" && "ticks" in (res as Record<string, unknown>)) {
+    const ticks = (res as Record<string, unknown>)["ticks"];
+    return Array.isArray(ticks) ? ticks : [];
+  }
+  return res;
+}
+
+export async function previewPortfolioImport(connector_id: string, payload: unknown): Promise<unknown> {
+  const res = await fetch("/api/portfolio/import/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ connector_id, payload }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  return res.json();
 }
 
 export async function postPerformance(scenario_id: string, perf: unknown): Promise<unknown> {

@@ -59,6 +59,24 @@ th {
   color: #ffffff;
 }
 
+table.portfolio-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+table.portfolio-table th,
+table.portfolio-table td {
+  padding: 6px 8px;
+  vertical-align: middle;
+}
+
+table.portfolio-table input,
+table.portfolio-table select {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
 /* NEW: lightweight tooltip (use on any element with class="tooltip" and data-tooltip="...") */
 .tooltip {
   position: relative;

@@ -6,10 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:imports": "node --loader tsx --test testing/imports.test.ts"
   },
   "dependencies": {
     "@auth0/nextjs-auth0": "^4.14.0",
+    "lucide-react": "^0.563.0",
     "next": "16.1.0",
     "react": "19.2.3",
     "react-dom": "19.2.3"
@@ -24,6 +26,7 @@
     "eslint-config-next": "16.1.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
+    "tsx": "^4.19.2",
     "typescript": "^5"
   }
 }

@@ -7,6 +7,8 @@ Sagitta Autonomous Allocation Agent (AAA) Frontend is the UI for running **alloc
 
 This frontend connects to the **Sagitta AAA In-Memory API** backend.
 
+Note: Policy Impact panel now binds to run allocator_version; removed stale v1 copy.
+
 ---
 
 ## What the UI Supports

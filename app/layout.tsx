@@ -6,8 +6,8 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Sagitta AAA — Decisions",
-  description: "Sagitta AAA frontend",
+  "title": "Sagitta Autonomous Allocation Agent (AAA)",
+  "description": "Decision intelligence for policy-driven portfolio allocation, simulation, and risk-aware analysis."
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
