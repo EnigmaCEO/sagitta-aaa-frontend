@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { getNoteBySlug, notes as NOTE_REGISTRY } from "../lib/content/notes";
 
 export const runtime = "nodejs";
 
@@ -165,8 +167,12 @@ type Institution = {
   id: string;
   title: string;
   tag?: string;
+  description_header?: string;
   description: string;
+  bullet_header?: string;
   bullets: string[];
+  closer_header?: string;
+  closer?: string;
   icon: IconName;
 };
 
@@ -175,42 +181,78 @@ const INSTITUTIONS: Institution[] = [
     id: "daos",
     title: "DAOs & On-Chain Governance",
     tag: "PRIMARY",
+    description_header: "Turn governance votes into enforceable capital decisions.",
     description:
-      "Turn DAO mandates into enforceable allocation policy. Preserve transparency while reducing discretionary failure.",
-    bullets: ["Encode mandates as policy", "Audit-grade decision trails"],
+      "Sagitta converts DAO mandates into deterministic allocation policy — executed consistently, audited automatically, and defensible under scrutiny.",
+    bullet_header:"What this unlocks",
+    bullets: ["Encode governance outcomes directly into allocation rules",
+        "Eliminate ad-hoc treasury decisions between votes",
+        "Produce audit-grade decision trails for token holders"],
+    closer_header:"Why this matters",
+    closer:
+      "DAOs don’t fail because of bad intent — they fail because discretionary execution drifts. Sagitta removes discretion without removing governance.",
     icon: "dao",
   },
   {
     id: "defi-pms",
     title: "DeFi Portfolio Managers & Crypto Funds",
     tag: "CORE",
+    description_header: "Quant discipline without black-box risk.",
     description:
-      "Operate with hedge-fund discipline in crypto market structure -- with clear guards and repeatable decision cycles.",
-    bullets: ["Wallet-native portfolio import", "Quant allocators inside guardrails"],
+      "Sagitta lets crypto funds run systematic allocation strategies inside explicit guardrails — with every decision explainable, replayable, and stress-tested.",
+    bullet_header:"What this unlocks",
+    bullets: ["Wallet-native portfolio import and normalization", 
+      "Rule-based allocators constrained by your risk doctrine",
+      "A/B testing of policies before capital is exposed"
+    ],
+    closer_header:"Why this matters",
+    closer:
+      "You already take risk. Sagitta makes that risk intentional, bounded, and reviewable — the difference between trading and managing capital.",
     icon: "wallet",
   },
   {
     id: "foundations",
     title: "Protocol Foundations & Ecosystem Treasuries",
+    description_header: "Treasury discipline that survives committees, turnover, and time.",
     description:
-      "Align ecosystem treasury decisions with committee constraints, liquidity limits, and reputational risk.",
-    bullets: ["Treasury discipline at scale", "Clear constraints for committees"],
+      "Sagitta aligns treasury execution with mandate constraints, liquidity limits, and reputational risk — without relying on individual operators.",
+    bullet_header:"What this unlocks",
+      bullets: ["Clear policy constraints that persist across stewards", 
+        "Deterministic execution aligned with committee decisions",
+        "Post-hoc justification for every treasury action"],
+    closer_header:"Why this matters",
+    closer:
+      "Foundations don’t get second chances. Sagitta ensures treasury behavior remains consistent even as people, markets, and narratives change.",
     icon: "building",
   },
   {
     id: "asset-managers",
     title: "Crypto-Native Asset Managers & Family Offices",
+    description_header: "Institutional control without custody or delegation risk.",
     description:
-      "Institutional controls without custody -- decisions can be reviewed, replayed, and defended.",
-    bullets: ["Institutional controls without custody", "Repeatable decision cycles"],
+      "Sagitta provides a decision layer that can be reviewed, replayed, and defended — without handing over keys or authority.",
+    bullet_header:"What this unlocks",
+      bullets: ["Non-custodial portfolio oversight", 
+        "Repeatable decision cycles aligned with investment philosophy",
+        "Clear separation between decision logic and execution"],
+    closer_header:"Why this matters",
+    closer:
+      "When capital is personal or reputational, intuition isn’t enough. Sagitta gives you institutional rigor without institutional overhead.",
     icon: "briefcase",
   },
   {
     id: "tradfi",
     title: "TradFi Institutions Entering DeFi",
+    description_header: "A policy layer between TradFi controls and on-chain execution.",
     description:
-      "A policy layer for on-chain sleeves: constrain exposure, document decisions, and integrate upstream of existing workflows.",
-    bullets: ["On-chain sleeves with policy limits", "Sits upstream of OMS/custody"],
+      "Sagitta acts as an on-chain sleeve controller — constraining exposure, documenting decisions, and integrating upstream of existing OMS and custody workflows.",
+    bullet_header:"What this unlocks",
+      bullets: ["Explicit policy limits enforced on-chain", 
+        "Decision records suitable for compliance review",
+        "Clean separation between TradFi process and DeFi execution"],
+    closer_header:"Why this matters",
+    closer:
+      "DeFi isn’t risky because it’s on-chain — it’s risky because it lacks familiar controls. Sagitta restores those controls without breaking the medium.",
     icon: "globe",
   },
 ];
@@ -282,13 +324,253 @@ const TIERS = [
   },
 ];
 
+type TocItem = {
+  id: string;
+  text: string;
+  level: 2 | 3;
+};
+
+type MarkdownBlock =
+  | { type: "h2"; id: string; text: string }
+  | { type: "h3"; id: string; text: string }
+  | { type: "p"; text: string }
+  | { type: "ul"; items: string[] };
+
+const trackEvent = (name: string, payload?: Record<string, string>) => {
+  console.log("[analytics]", name, payload ?? {});
+};
+
+const slugifyHeading = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+const countWords = (content: string) => {
+  const normalized = content.replace(/[#*_`>\\-]/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return 0;
+  }
+  return normalized.split(" ").length;
+};
+
+const parseMarkdown = (content: string) => {
+  const blocks: MarkdownBlock[] = [];
+  const headings: TocItem[] = [];
+  const seen = new Map<string, number>();
+
+  const nextId = (text: string) => {
+    const base = slugifyHeading(text);
+    const count = (seen.get(base) ?? 0) + 1;
+    seen.set(base, count);
+    return count === 1 ? base : `${base}-${count}`;
+  };
+
+  const lines = content.split(/\r?\n/);
+  let paragraph: string[] = [];
+  let listItems: string[] = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length > 0) {
+      blocks.push({ type: "p", text: paragraph.join(" ") });
+      paragraph = [];
+    }
+  };
+
+  const flushList = () => {
+    if (listItems.length > 0) {
+      blocks.push({ type: "ul", items: [...listItems] });
+      listItems = [];
+    }
+  };
+
+  lines.forEach((raw) => {
+    const line = raw.trim();
+    if (!line) {
+      flushParagraph();
+      flushList();
+      return;
+    }
+
+    if (line.startsWith("## ")) {
+      flushParagraph();
+      flushList();
+      const text = line.slice(3).trim();
+      const id = nextId(text);
+      blocks.push({ type: "h2", id, text });
+      headings.push({ id, text, level: 2 });
+      return;
+    }
+
+    if (line.startsWith("### ")) {
+      flushParagraph();
+      flushList();
+      const text = line.slice(4).trim();
+      const id = nextId(text);
+      blocks.push({ type: "h3", id, text });
+      headings.push({ id, text, level: 3 });
+      return;
+    }
+
+    if (line.startsWith("- ") || line.startsWith("* ")) {
+      flushParagraph();
+      listItems.push(line.slice(2).trim());
+      return;
+    }
+
+    paragraph.push(line);
+  });
+
+  flushParagraph();
+  flushList();
+
+  return { blocks, headings };
+};
+
+const renderMarkdownBlocks = (blocks: MarkdownBlock[]) =>
+  blocks.map((block, index) => {
+    if (block.type === "h2") {
+      return (
+        <h2 key={`${block.id}-${index}`} id={block.id} className="note-heading note-h2">
+          {block.text}
+        </h2>
+      );
+    }
+    if (block.type === "h3") {
+      return (
+        <h3 key={`${block.id}-${index}`} id={block.id} className="note-heading note-h3">
+          {block.text}
+        </h3>
+      );
+    }
+    if (block.type === "ul") {
+      return (
+        <ul key={`list-${index}`} className="note-list">
+          {block.items.map((item, itemIndex) => (
+            <li key={`${item}-${itemIndex}`}>{item}</li>
+          ))}
+        </ul>
+      );
+    }
+    return (
+      <p key={`p-${index}`} className="note-paragraph">
+        {block.text}
+      </p>
+    );
+  });
+
 export default function MarketingPage() {
   const [activeInstitutionId, setActiveInstitutionId] = useState(INSTITUTIONS[0].id);
   const activeInstitution = INSTITUTIONS.find((item) => item.id === activeInstitutionId) ?? INSTITUTIONS[0];
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const noteSlug = searchParams.get("note");
+  const activeNote = useMemo(() => getNoteBySlug(noteSlug), [noteSlug]);
+  const noteOpen = Boolean(noteSlug);
+  const noteFallback =
+    noteSlug && !activeNote
+      ? { title: "Note not found", subtitle: "Unknown note", date: "", content: "", audioUrl: undefined }
+      : null;
+  const note = activeNote ?? noteFallback;
+  const { blocks, headings } = useMemo(() => parseMarkdown(note?.content ?? ""), [note?.content]);
+  const wordCount = useMemo(() => countWords(note?.content ?? ""), [note?.content]);
+  const readingTime = wordCount > 0 ? Math.max(1, Math.ceil(wordCount / 200)) : null;
+  const [tocOpen, setTocOpen] = useState(false);
+
+  useEffect(() => {
+    if (!noteSlug) {
+      return;
+    }
+    trackEvent("note_opened", { slug: noteSlug });
+  }, [noteSlug]);
+
+  useEffect(() => {
+    // Defer closing the TOC to avoid synchronous state updates during the effect.
+    // Only close if the TOC is currently open to prevent unnecessary state changes.
+    if (!tocOpen) {
+      return;
+    }
+    const id = window.setTimeout(() => setTocOpen(false), 0);
+    return () => clearTimeout(id);
+  }, [noteSlug, tocOpen]);
+
+  const closeNote = useCallback(() => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("note");
+    const query = params.toString();
+    const target = query ? `${pathname}?${query}` : pathname;
+    const currentQuery = searchParams.toString();
+    const current = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+    if (target === current) {
+      return;
+    }
+    try {
+      const result = router.push(target, { scroll: false });
+      Promise.resolve(result).catch(() => undefined);
+    } catch (err) {
+      console.warn("Navigation error:", err);
+    }
+  }, [searchParams, pathname, router]);
+
+  const openNote = useCallback(
+    (slug: string) => {
+      if (!slug || slug === noteSlug) {
+        return;
+      }
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("note", slug);
+      const query = params.toString();
+      const target = `${pathname}?${query}`;
+      const currentQuery = searchParams.toString();
+      const current = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+      if (target === current) {
+        return;
+      }
+      try {
+        const result = router.push(target, { scroll: false });
+        Promise.resolve(result).catch(() => undefined);
+      } catch (err) {
+        console.warn("Navigation error:", err);
+      }
+    },
+    [searchParams, pathname, router, noteSlug],
+  );
+
+  const handleCopyLink = useCallback(() => {
+    if (!noteSlug || typeof window === "undefined") {
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("note", noteSlug);
+    const link = url.toString();
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(link).catch(() => undefined);
+    }
+    trackEvent("note_copied", { slug: noteSlug });
+  }, [noteSlug]);
+
+  useEffect(() => {
+    if (!noteOpen) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeNote();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [noteOpen, closeNote]);
 
   return (
     <>
-      <header style={{ width: "100%", borderBottom: "1px solid rgba(255,255,255,0.1)" }}>
+      <header style={{ width: "100%" }}>
         <div className="marketing-shell" style={{ maxWidth: "90%", margin: "0 auto", padding: "18px 32px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%" }}>
             <Link href="/" style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
@@ -404,7 +686,6 @@ export default function MarketingPage() {
                       <button
                         key={item.id}
                         type="button"
-                        aria-selected={active}
                         onClick={() => setActiveInstitutionId(item.id)}
                         className={`menu-item focus-ring ${active ? "active" : ""}`}
                         style={{
@@ -455,14 +736,20 @@ export default function MarketingPage() {
 
               <div className="surface-strong panel">
                 <div className="row-between">
-                  <div style={{ fontSize: 12, color: "rgba(255,255,255,0.6)" }}>Institution Focus</div>
+                  <div style={{ fontSize: 12, color: "rgba(255,255,255,0.6)" }}>Why Sagitta AAA Exists for You</div>
                   <Icon name="badge" size={18} stroke={1.5} className="accent-text" />
                 </div>
                 <div style={{ marginTop: 12, fontSize: 20, fontWeight: 600 }}>{activeInstitution.title}</div>
+                <p style={{ marginTop: 12, fontSize: 14, color: "rgba(255,255,255,0.7)", fontWeight: "bold" }}>
+                  {activeInstitution.description_header}
+                </p>
                 <p style={{ marginTop: 12, fontSize: 14, color: "rgba(255,255,255,0.7)" }}>
                   {activeInstitution.description}
                 </p>
                 <div style={{ marginTop: 16, display: "grid", gap: 10 }}>
+                <p style={{ marginTop: 12, fontSize: 14, color: "rgba(255,255,255,0.7)", fontWeight: "bold" }}>
+                  {activeInstitution.bullet_header}
+                </p>
                   {activeInstitution.bullets.map((bullet) => (
                     <div key={bullet} className="row" style={{ fontSize: 13, color: "rgba(255,255,255,0.75)" }}>
                       <Icon name="check" size={14} stroke={1.5} className="accent-text" />
@@ -470,6 +757,13 @@ export default function MarketingPage() {
                     </div>
                   ))}
                 </div>
+                <div style={{ marginTop: 16, display: "grid", gap: 10 }}></div>
+                <p style={{ marginTop: 12, fontSize: 14, color: "rgba(255,255,255,0.7)", fontWeight: "bold" }}>
+                  {activeInstitution.closer_header}
+                </p>
+                <p style={{ marginTop: 12, fontSize: 14, color: "rgba(255,255,255,0.7)" }}>
+                  {activeInstitution.closer}
+                </p>
               </div>
             </div>
           </section>
@@ -530,7 +824,7 @@ export default function MarketingPage() {
                   </div>
                   {tier.cta.href.startsWith("mailto") ? (
                     <a
-                      href={tier.cta.href}
+                      href={tier.cta.href} 
                       className={`focus-ring cta-btn ${tier.primary ? "btn-primary" : "cta-outline"}`}
                       style={{ marginTop: 20, textAlign: "center" }}
                     >
@@ -538,7 +832,7 @@ export default function MarketingPage() {
                     </a>
                   ) : (
                     <Link
-                      href={tier.cta.href}
+                      href={tier.cta.href} prefetch={false}
                       className={`focus-ring cta-btn ${tier.primary ? "btn-primary" : "cta-outline"}`}
                       style={{ marginTop: 20, textAlign: "center" }}
                     >
@@ -556,31 +850,34 @@ export default function MarketingPage() {
               Public reasoning behind deterministic allocation, policy, and system design.
             </p>
             <div style={{ marginTop: 24, display: "grid", gap: 16 }}>
-              {[
-                {
-                  title: "Authority-Gated Decision Intelligence for Crypto-Native Institutions",
-                  href: "",
-                },
-                {
-                  title: "Designing Enforceable Allocation Policy for DAOs",
-                  href: "",
-                },
-                {
-                  title: "Scenario Governance in On-Chain Markets",
-                  href: "",
-                },
-              ].map((note) => (
-                <a
-                  key={note.title}
-                  href={note.href}
-                  className="surface panel hover-card focus-ring"
-                  style={{ textDecoration: "none", display: "block", borderRadius: 12 }}
-                >
-                  <div style={{ fontSize: 16, fontWeight: 600, color: "#e6edf3" }}>{note.title}</div>
-                  <div style={{ marginTop: 8, fontSize: 13, color: "rgba(255,255,255,0.7)" }}>Read article &rarr;</div>
-                </a>
-              ))}
-              </div>
+              {NOTE_REGISTRY.map((noteItem) => {
+                const isActive = noteItem.slug === noteSlug;
+                return (
+                  <button
+                    key={noteItem.title}
+                    type="button"
+                    onClick={() => openNote(noteItem.slug)}
+                    className="surface panel hover-card focus-ring note-card"
+                    style={{
+                      textDecoration: "none",
+                      display: "block",
+                      borderRadius: 12,
+                      textAlign: "left",
+                      background: isActive ? "rgba(99,212,255,0.12)" : undefined,
+                      borderColor: isActive ? "rgba(99,212,255,0.4)" : undefined,
+                    }}
+                  >
+                    <div style={{ fontSize: 16, fontWeight: 600, color: "#e6edf3", paddingBottom: "8px" }}>
+                      {noteItem.title}
+                    </div>
+                    <div style={{ fontSize: 13, fontStyle: "italic", color: "rgba(255, 255, 255, 0.6)" }}>
+                      {noteItem.subtitle}
+                    </div>
+                    <div style={{ marginTop: 8, fontSize: 13, color: "rgba(255,255,255,0.7)" }}>Read -&gt;</div>
+                  </button>
+                );
+              })}
+            </div>
 
             
           </section>
@@ -601,6 +898,116 @@ export default function MarketingPage() {
           </footer>
         </div>
       </main>
+      {noteOpen ? (
+        <div className="note-drawer-overlay" role="presentation" onClick={closeNote}>
+          <div
+            className="note-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Research note"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="note-drawer-inner">
+              <div className="note-drawer-header">
+                <div>
+                  <div className="note-title" id="note-title">
+                    {note?.title}
+                  </div>
+                  <div className="note-subtitle">{note?.subtitle}</div>
+                  <div className="note-meta">
+                    <span>{note?.date || "--"}</span>
+                    <span className="note-meta-divider">|</span>
+                    <span>{readingTime ? `${readingTime} min read` : "--"}</span>
+                  </div>
+                </div>
+                <div className="note-header-actions">
+                  <button type="button" className="note-button focus-ring" style={{textWrapMode: "nowrap"}} onClick={handleCopyLink}>
+                    Copy link
+                  </button>
+                  <button type="button" className="note-button focus-ring" onClick={closeNote} aria-label="Close note">
+                    Close
+                  </button>
+                </div>
+              </div>
+
+              {note?.audioUrl ? (
+                <div className="note-audio">
+                  <audio controls preload="none">
+                    <source src={note.audioUrl} />
+                  </audio>
+                </div>
+              ) : null}
+
+              {headings.length > 0 ? (
+                <div className="note-toc-mobile">
+                  <button
+                    type="button"
+                    className="note-button focus-ring"
+                    aria-expanded={tocOpen}
+                    onClick={() => setTocOpen((prev) => !prev)}
+                  >
+                    Contents
+                  </button>
+                  {tocOpen ? (
+                    <div className="note-toc-list">
+                      {headings.map((heading) => (
+                        <button
+                          key={heading.id}
+                          type="button"
+                          className={`note-toc-link level-${heading.level}`}
+                          onClick={() => {
+                            const el = document.getElementById(heading.id);
+                            if (el) {
+                              el.scrollIntoView({ behavior: "smooth", block: "start" });
+                            }
+                          }}
+                        >
+                          {heading.text}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="note-drawer-body">
+                {headings.length > 0 ? (
+                  <aside className="note-toc">
+                    <div className="note-toc-title">Contents</div>
+                    <div className="note-toc-list">
+                      {headings.map((heading) => (
+                        <button
+                          key={heading.id}
+                          type="button"
+                          className={`note-toc-link level-${heading.level}`}
+                          onClick={() => {
+                            const el = document.getElementById(heading.id);
+                            if (el) {
+                              el.scrollIntoView({ behavior: "smooth", block: "start" });
+                            }
+                          }}
+                        >
+                          {heading.text}
+                        </button>
+                      ))}
+                    </div>
+                  </aside>
+                ) : null}
+
+                <div className="note-content">
+                  {note && note === noteFallback ? (
+                    <div className="note-empty">Note not found.</div>
+                  ) : blocks.length > 0 ? (
+                    renderMarkdownBlocks(blocks)
+                  ) : (
+                    <div className="note-empty">Content pending.</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </>
   );
 }

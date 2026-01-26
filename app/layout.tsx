@@ -25,9 +25,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             --muted: #9aa4b2;
           }
           .marketing-page {
-            background: radial-gradient(900px 520px at 8% -10%, rgba(99, 212, 255, 0.2), transparent 60%),
-              radial-gradient(860px 560px at 90% 5%, rgba(99, 212, 255, 0.1), transparent 60%),
-              #0b0d10;
+            
             color: #e6edf3;
             min-height: 100vh;
             position: relative;
@@ -36,7 +34,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             content: "";
             position: absolute;
             inset: 0;
-            background-image: radial-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+
             background-size: 3px 3px;
             opacity: 0.12;
             pointer-events: none;
@@ -263,6 +261,182 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             display: flex;
             align-items: center;
             justify-content: space-between;
+          }
+          .note-card {
+            transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+          }
+          .note-card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(99, 212, 255, 0.3);
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+          }
+          .note-drawer-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(4, 6, 10, 0.72);
+            display: flex;
+            justify-content: flex-end;
+            z-index: 80;
+          }
+          .note-drawer {
+            width: min(720px, 100%);
+            height: 100%;
+            background: #0b0f14;
+            border-left: 1px solid rgba(255, 255, 255, 0.12);
+            box-shadow: -24px 0 80px rgba(0, 0, 0, 0.6);
+          }
+          .note-drawer-inner {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+          }
+          .note-drawer-header {
+            padding: 24px 28px 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+          }
+          .note-title {
+            font-size: 22px;
+            font-weight: 600;
+            color: #e6edf3;
+          }
+          .note-subtitle {
+            margin-top: 6px;
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.6);
+            font-style: italic;
+          }
+          .note-meta {
+            margin-top: 8px;
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.5);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+          }
+          .note-meta-divider {
+            opacity: 0.4;
+          }
+          .note-header-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+          }
+          .note-button {
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            background: rgba(255, 255, 255, 0.04);
+            color: #e6edf3;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+          }
+          .note-button:hover {
+            border-color: rgba(99, 212, 255, 0.5);
+            background: rgba(99, 212, 255, 0.12);
+          }
+          .note-audio {
+            padding: 12px 28px 0;
+            text-align: center;
+          }
+          .note-audio audio {
+            width: 50%;
+            height: 32px;
+          }
+          .note-drawer-body {
+            flex: 1;
+            display: grid;
+            gap: 24px;
+            padding: 20px 28px 32px;
+            overflow: hidden;
+          }
+          .note-toc {
+            border-right: 1px solid rgba(255, 255, 255, 0.08);
+            padding-right: 16px;
+          }
+          .note-toc-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: rgba(255, 255, 255, 0.5);
+            margin-bottom: 12px;
+          }
+          .note-toc-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+          }
+          .note-toc-link {
+            text-align: left;
+            background: transparent;
+            border: 0;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 13px;
+            cursor: pointer;
+          }
+          .note-toc-link.level-3 {
+            padding-left: 12px;
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.6);
+          }
+          .note-toc-link:hover {
+            color: var(--accent-strong);
+          }
+          .note-toc-mobile {
+            display: none;
+            padding: 12px 28px 0;
+          }
+          .note-content {
+            overflow-y: auto;
+            padding-right: 8px;
+          }
+          .note-heading {
+            margin-top: 24px;
+            margin-bottom: 12px;
+            font-weight: 600;
+          }
+          .note-h2 {
+            font-size: 18px;
+          }
+          .note-h3 {
+            font-size: 15px;
+            color: rgba(255, 255, 255, 0.8);
+          }
+          .note-paragraph {
+            margin-bottom: 16px;
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.75);
+            line-height: 1.6;
+          }
+          .note-list {
+            margin-bottom: 16px;
+            padding-left: 18px;
+            color: rgba(255, 255, 255, 0.75);
+            font-size: 14px;
+            line-height: 1.6;
+          }
+          .note-empty {
+            padding: 24px 0;
+            color: rgba(255, 255, 255, 0.55);
+            font-size: 14px;
+          }
+          @media (max-width: 960px) {
+            .note-drawer-header {
+              flex-direction: column;
+              align-items: flex-start;
+            }
+            .note-drawer-body {
+              grid-template-columns: 1fr;
+            }
+            .note-toc {
+              display: none;
+            }
+            .note-toc-mobile {
+              display: block;
+            }
           }
         `}</style>
         {children}
