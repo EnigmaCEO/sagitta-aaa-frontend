@@ -291,6 +291,9 @@ const FEATURES = [
   },
 ];
 
+const SANDBOX_RETURN = "/billing?plan_key=sandbox";
+const SANDBOX_LOGIN = `/auth/login?returnTo=${encodeURIComponent(SANDBOX_RETURN)}`;
+
 const TIERS = [
   {
     title: "Observer Access",
@@ -312,7 +315,7 @@ const TIERS = [
     bullets: ["Policy creation with enforceable constraints", "Regime-aware scenario simulation", "Persistant decision logs for audit and review"
         ,"Wallet-native and custom portfolio imports"
     ],
-    cta: { label: "Start Sandbox", href: "/auth/login" },
+    cta: { label: "Start Sandbox", href: SANDBOX_LOGIN },
     icon: "flask" as IconName,
   },
   {
@@ -687,7 +690,7 @@ export default function MarketingPageClient() {
                           borderRadius: 14,
                           padding: 12,
                           border: "1px solid rgba(255,255,255,0.12)",
-                          background: active ? "rgba(99,212,255,0.12)" : "transparent",
+                          background: active ? "rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.12)" : "transparent",
                         }}
                       >
                         <div className="row" style={{ alignItems: "center" }}>
@@ -699,7 +702,7 @@ export default function MarketingPageClient() {
                               display: "flex",
                               alignItems: "center",
                               justifyContent: "center",
-                              background: active ? "rgba(99,212,255,0.18)" : "rgba(255,255,255,0.08)",
+                              background: active ? "rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.18)" : "rgba(255,255,255,0.08)",
                               border: "1px solid rgba(255,255,255,0.12)",
                             }}
                           >
@@ -866,8 +869,8 @@ export default function MarketingPageClient() {
                       display: "block",
                       borderRadius: 12,
                       textAlign: "left",
-                      background: isActive ? "rgba(99,212,255,0.12)" : undefined,
-                      borderColor: isActive ? "rgba(99,212,255,0.4)" : undefined,
+                      background: isActive ? "rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.12)" : undefined,
+                      borderColor: isActive ? "rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.4)" : undefined,
                     }}
                   >
                     <div style={{ fontSize: 16, fontWeight: 600, color: "#e6edf3", paddingBottom: "8px" }}>{noteItem.title}</div>
@@ -875,7 +878,15 @@ export default function MarketingPageClient() {
                     <div style={{ marginTop: 8, fontSize: 13, color: "rgba(255,255,255,0.7)", display: "flex", alignItems: "center", gap: 8 }}>
                       <span>Read -&gt;</span>
                       {noteItem.audioUrl ? (
-                        <span style={{ fontSize: 11, color: "#9fbdd8", border: "1px solid rgba(159,189,216,0.35)", padding: "2px 8px", borderRadius: 999 }}>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            color: "var(--sagitta-blue-muted, #7AA1C2)",
+                            border: "1px solid rgba(var(--sagitta-blue-muted-rgb, 122, 161, 194), 0.35)",
+                            padding: "2px 8px",
+                            borderRadius: 999,
+                          }}
+                        >
                           Audio Available
                         </span>
                       ) : null}

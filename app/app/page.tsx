@@ -30,7 +30,6 @@ import {
   putRegime,
   explainTick,
   previewPortfolioImport,
-  postStripe,
   listPortfolios,
   getPortfolio,
   upsertPortfolio,
@@ -1113,9 +1112,7 @@ export default function Page() {
     setLoading(true);
 
     try {
-      const { url } = await postStripe("sandbox");
-      window.location.href = url;
-
+      window.location.assign("/billing?plan_key=sandbox");
     } catch (e: unknown) {
       setLoading(false);
     }
@@ -3450,6 +3447,8 @@ export default function Page() {
     return `${level}`;
   }, [authorityLevel]);
 
+  const isPortfolioBlank = (portfolioDraft?.assets ?? []).length === 0;
+
   if (meInfo === null) return null;
 
   return (
@@ -3471,8 +3470,8 @@ export default function Page() {
             />
           </div>
           <div style={{ textAlign: "center", minWidth: 0 }}>
-            <div style={{ fontSize: 11, color: "#7aa1c2", letterSpacing: 0.6 }}>Current Authority</div>
-            <div style={{ fontSize: 14, fontWeight: 600, color: "#cbe8ff" }}>{authorityTierLabel}</div>
+            <div style={{ fontSize: 11, color: "var(--sagitta-blue-muted, #7AA1C2)", letterSpacing: 0.6 }}>Current Authority</div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--sagitta-blue, #63D4FF)" }}>{authorityTierLabel}</div>
           </div>
           <div style={{ justifySelf: "end", display: "flex", gap: 8, alignItems: "center" }}>
             {(authorityLevel ?? 0) > 0 ? (
@@ -3482,7 +3481,7 @@ export default function Page() {
                 style={{
                   background: "transparent",
                   border: "1px solid rgba(255,255,255,0.06)",
-                  color: "#cbe8ff",
+                  color: "var(--sagitta-blue, #63D4FF)",
                   padding: "6px 10px",
                   borderRadius: 6,
                 }}
@@ -3496,7 +3495,7 @@ export default function Page() {
                 style={{
                   background: "transparent",
                   border: "1px solid rgba(255,255,255,0.06)",
-                  color: "#cbe8ff",
+                  color: "var(--sagitta-blue, #63D4FF)",
                   padding: "6px 10px",
                   borderRadius: 6,
                 }}
@@ -3509,15 +3508,15 @@ export default function Page() {
       </header>
 
       {/* NEW: render me info (if present) to help confirm sqlite upsert and authority 
-      <div style={{ margin: "8px 0", padding: 8, borderRadius: 8, background: "#0b1220", color: "#cbe8ff", display: "block" }}>
+      <div style={{ margin: "8px 0", padding: 8, borderRadius: 8, background: "var(--surface)", color: "var(--sagitta-blue, #63D4FF)", display: "block" }}>
         <strong>User info (from /api/aaa/me):</strong>
-        <div style={{ marginTop: 6, fontSize: 13, color: "#9fbdd8" }}>
+        <div style={{ marginTop: 6, fontSize: 13, color: "var(--sagitta-blue-muted, #7AA1C2)" }}>
           {meError ? (
             <span style={{ color: "#ffb4b4" }}>Error: {meError}</span>
           ) : meInfo ? (
             <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{JSON.stringify(meInfo, null, 2)}</pre>
           ) : (
-            <span style={{ color: "#8aa3be" }}>loading…</span>
+            <span style={{ color: "var(--sagitta-blue-muted, #7AA1C2)" }}>loading…</span>
           )}
         </div>
       </div>
@@ -3568,10 +3567,10 @@ export default function Page() {
                   </select>
                 </label>
               )}
-              <span style={{ color: "#9fbdd8", fontSize: 12 }}>
+              <span style={{ color: "var(--sagitta-blue-muted, #7AA1C2)", fontSize: 12 }}>
                 <strong>Scenario ID:</strong> {scenarioId || (scenariosLoaded ? "—" : "loading…")}
               </span>
-              {loading ? <span style={{ fontSize: 12, color: "#9fbdd8" }}>loading…</span> : null}
+              {loading ? <span style={{ fontSize: 12, color: "var(--sagitta-blue-muted, #7AA1C2)" }}>loading…</span> : null}
             </div>
           </section>
           <div style={{ height: 12 }} />
@@ -3597,7 +3596,7 @@ export default function Page() {
           {/* Portfolio */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
             <div>
-              <h2 style={{ marginBottom: 6 }}>Portfolio</h2>
+              <h2 style={{ marginBottom: 6 }}>Define Portfolio</h2>
 
               <div style={{ color: "#666", fontSize: 13 }}>
                 Facts only: define assets and base beliefs used by the allocator.
@@ -3608,50 +3607,59 @@ export default function Page() {
             {/* NEW: right-aligned portfolio actions */}
             { (authorityLevel ?? 0) > 0 && (
             <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              <input
-                value={portfolioNameDraft}
-                onChange={(e) => setPortfolioNameDraft(e.target.value)}
-                placeholder="Portfolio name"
-                style={{ minWidth: 200 }}
-              />
+              {!isPortfolioBlank ? (
+                <>
+                  <input
+                    value={portfolioNameDraft}
+                    onChange={(e) => setPortfolioNameDraft(e.target.value)}
+                    placeholder="Portfolio name"
+                    style={{ minWidth: 200 }}
+                  />
 
-              <select
-                value={selectedSavedPortfolioId}
-                onChange={(e) => {
-                  const id = e.target.value;
-                  setSelectedSavedPortfolioId(id);
-                  if (id) {
-                    loadSavedPortfolio(id);
-                  } else if (scenarioId) {
-                    void (async () => {
-                      try {
-                        await setScenarioActive(scenarioId, { active_portfolio_id: null });
-                        setScenarioActivePortfolioId(null);
-                      } catch (err) {
-                        console.error("Failed to clear active portfolio", err);
+                  <select
+                    value={selectedSavedPortfolioId}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setSelectedSavedPortfolioId(id);
+                      if (id) {
+                        loadSavedPortfolio(id);
+                      } else if (scenarioId) {
+                        void (async () => {
+                          try {
+                            await setScenarioActive(scenarioId, { active_portfolio_id: null });
+                            setScenarioActivePortfolioId(null);
+                          } catch (err) {
+                            console.error("Failed to clear active portfolio", err);
+                          }
+                        })();
                       }
-                    })();
-                  }
-                }}
-                style={{ minWidth: 240 }}
-              >
-                <option value="">(Saved portfolios)</option>
-                {savedPortfolios.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} {EM_DASH} {new Date(p.updatedAt).toLocaleString()}
-                  </option>
-                ))}
-              </select>
+                    }}
+                    style={{ minWidth: 240 }}
+                  >
+                    <option value="">(Saved portfolios)</option>
+                    {savedPortfolios.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} {EM_DASH} {new Date(p.updatedAt).toLocaleString()}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              ) : null}
 
-              <button onClick={onOpenImportModal} disabled={loading}>
+              <button onClick={onOpenImportModal} disabled={loading} className="btn-primary">
                 Import
               </button>
-              <button onClick={clearPortfolio} disabled={loading}>
-                Clear
-              </button>
-              <button onClick={saveCurrentPortfolioToLibrary} disabled={loading}>
-                Save
-              </button>
+
+              {!isPortfolioBlank ? (
+                <>
+                  <button onClick={clearPortfolio} disabled={loading}>
+                    Clear
+                  </button>
+                  <button onClick={saveCurrentPortfolioToLibrary} disabled={loading}>
+                    Save
+                  </button>
+                </>
+              ) : null}
             </div>
             ) }
           </div>
@@ -3866,7 +3874,16 @@ export default function Page() {
                   <td>
                     <select
                       value={newAssetDraft.risk_class}
-                      onChange={(e) => setNewAssetDraft((s) => ({ ...s, risk_class: (e.target.value as RiskClass) || "" }))}
+                      onChange={(e) => {
+                        const nextRiskClass = (e.target.value as RiskClass) || "";
+                        const priors = applyPriors(nextRiskClass);
+                        setNewAssetDraft((s) => ({
+                          ...s,
+                          risk_class: nextRiskClass,
+                          expected_return: String(priors.expected_return),
+                          volatility: String(priors.volatility),
+                        }));
+                      }}
                     >
                       <option value="">{humanizeOption("(none)")}</option>
                       <option value="stablecoin">{humanizeOption("stablecoin")}</option>
@@ -3952,7 +3969,7 @@ export default function Page() {
 
         <section style={styles.sectionCard}>
           {/* Allocation Policy */}
-          <h2>Allocation Policy</h2>
+          <h2>Set Allocation Policy</h2>
 
           <div style={{ color: "#666", fontSize: 13, marginBottom: 12 }}>
             Rules (constraints) and Decision Context (regime). No asset duplication here.
@@ -4371,7 +4388,7 @@ export default function Page() {
               ? "Simulation Mode: This illustrates policy behavior over sequential ticks under assumed risk-class regimes. It does not model real prices or performance."
               : analysisMode
                 ? "Compare two Allocation Policies (A vs B) on the same Portfolio using one deterministic tick per side."
-                : "Executes a protocol allocation tick and returns target_weights for the next allocation."}
+                : "Executes a protocol allocation descision record and returns target_weights for the next allocation."}
           </div>
           <hr style={styles.hr} />
           {/* CHANGE: put Analysis Mode toggle on the Decision Type row */}
@@ -4551,11 +4568,11 @@ export default function Page() {
             }
           >
             {runDecisionType === "simulation" ? (
-              <button className="btn-primary" onClick={onRunSimulation} disabled={loading} style={{ minWidth: 320 }}>
+              <button className="btn-primary" onClick={onRunSimulation} disabled={loading || isPortfolioBlank} style={{ minWidth: 320 }}>
                 Run Simulation
               </button>
             ) : !analysisMode ? (
-              <button className="btn-primary" onClick={onRunTick} disabled={loading} style={{ minWidth: 320 }}>
+              <button className="btn-primary" onClick={onRunTick} disabled={loading || isPortfolioBlank} style={{ minWidth: 320 }}>
                 Execute Allocation Decision
               </button>
             ) : (
@@ -4906,7 +4923,7 @@ export default function Page() {
                                       textOverflow: "ellipsis",
                                       fontFamily: "monospace",
                                       fontSize: 12,
-                                      color: "#9fbdd8",
+                                      color: "var(--sagitta-blue-muted, #7AA1C2)",
                                       verticalAlign: "bottom",
                                     }}
                                   >

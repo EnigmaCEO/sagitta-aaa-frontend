@@ -6,7 +6,32 @@
 :root {
   --background: #000000;
   --foreground: #ededed;
+  --sagitta-blue: #63d4ff;
+  --sagitta-blue-strong: #7be3ff;
+  --sagitta-blue-muted: #7AA1C2;
+  --sagitta-blue-rgb: 99, 212, 255;
+  --sagitta-blue-strong-rgb: 123, 227, 255;
+  --sagitta-blue-muted-rgb: 122, 161, 194;
+  --accent: var(--sagitta-blue);
+  --accent-strong: var(--sagitta-blue-strong);
+  --accent-muted: var(--sagitta-blue-muted);
+  --accent-soft: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.14);
+  --surface: rgba(255, 255, 255, 0.04);
+  --surface-strong: rgba(255, 255, 255, 0.08);
+  --border: rgba(255, 255, 255, 0.12);
+  --muted: #9aa4b2;
+  --btn-primary-bg: var(--sagitta-blue);
+  --btn-primary-bg-hover: var(--sagitta-blue-strong);
+  --btn-primary-text: #000;
+  --btn-secondary-bg: #1a1a1a;
+  --btn-secondary-bg-hover: #2a2a2a;
+  --btn-secondary-border: #333;
+  --btn-secondary-text: #fff;
+  --btn-disabled-bg: #0f0f0f;
+  --btn-disabled-text: #666;
+  --btn-disabled-border: #222;
 }
+
 
 @theme inline {
   --color-background: var(--background);
@@ -22,28 +47,61 @@ body {
 }
 
 button {
-  background-color: #142855;
-  color: #fff;
-  border: 1px solid rgba(0, 0, 0, 0.08);
+  background-color: var(--btn-secondary-bg);
+  color: var(--btn-secondary-text);
+  border: 1px solid var(--btn-secondary-border);
   border-radius: 6px;
   padding: 10px 12px;
   cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+button:hover:not(:disabled):not(.btn-primary) {
+  background-color: var(--btn-secondary-bg-hover);
+  border-color: var(--btn-secondary-border);
+}
+
+button:active:not(:disabled):not(.btn-primary) {
+  background-color: #222;
+}
+
+button:focus-visible:not(:disabled) {
+  outline: 2px solid var(--sagitta-blue);
+  outline-offset: 2px;
 }
 
 /* NEW: primary CTA */
 button.btn-primary {
-  background-color: #1b7f3a; /* green */
-  border-color: rgba(0, 0, 0, 0.10);
+  background-color: var(--btn-primary-bg);
+  border: 1px solid rgba(var(--sagitta-blue-rgb), 0.95);
+  color: var(--btn-primary-text);
 }
 
 button.btn-primary:hover:not(:disabled) {
-  filter: brightness(0.95);
+  background-color: var(--btn-primary-bg-hover);
+  border-color: rgba(var(--sagitta-blue-strong-rgb), 0.95);
+}
+
+button.btn-primary:active:not(:disabled),
+button.btn-primary:focus-visible:not(:disabled) {
+  background-color: var(--btn-primary-bg-hover);
+  border-color: rgba(var(--sagitta-blue-strong-rgb), 0.95);
 }
 
 button:disabled {
-  opacity: 0.6;
   cursor: not-allowed;
-  background-color: #55555533;
+  background-color: var(--btn-disabled-bg);
+  border-color: var(--btn-disabled-border);
+  color: var(--btn-disabled-text);
+}
+
+button:disabled:hover,
+button:disabled:active,
+button:disabled:focus-visible {
+  background-color: var(--btn-disabled-bg);
+  border-color: var(--btn-disabled-border);
+  color: var(--btn-disabled-text);
+  outline: none;
 }
 
 input,

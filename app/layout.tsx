@@ -15,15 +15,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
       <body className="antialiased bg-black text-white">
         <style>{`
-          :root {
-            --accent: #63d4ff;
-            --accent-strong: #7be3ff;
-            --accent-soft: rgba(99, 212, 255, 0.14);
-            --surface: rgba(255, 255, 255, 0.04);
-            --surface-strong: rgba(255, 255, 255, 0.08);
-            --border: rgba(255, 255, 255, 0.12);
-            --muted: #9aa4b2;
-          }
           .marketing-page {
             
             color: #e6edf3;
@@ -59,7 +50,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           }
           @media (min-width: 960px) {
             .hero-grid {
-              grid-template-columns: 1.1fr 0.9fr;
+              
               align-items: center;
             }
           }
@@ -83,7 +74,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             margin-top: 24px;
             font-size: 18px;
             color: rgba(255, 255, 255, 0.75);
-            max-width: 720px;
+            max-width: 80%;
           }
           .hero-pain {
             margin-top: 16px;
@@ -95,6 +86,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             margin-top: 24px;
             display: grid;
             gap: 16px;
+            max-width: 80%;
           }
           @media (min-width: 640px) {
             .highlights-grid {
@@ -193,7 +185,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             gap: 8px;
           }
           .focus-ring:focus-visible {
-            outline: 2px solid rgba(99, 212, 255, 0.8);
+            outline: 2px solid rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.8);
             outline-offset: 2px;
           }
           .menu-item {
@@ -201,24 +193,24 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           }
           .menu-item:hover {
             transform: translateY(-1px);
-            border-color: rgba(99, 212, 255, 0.35);
+            border-color: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.35);
             background: rgba(255, 255, 255, 0.06);
           }
           .menu-item.active {
-            background: rgba(99, 212, 255, 0.12);
-            border-color: rgba(99, 212, 255, 0.5);
-            box-shadow: inset 3px 0 0 rgba(99, 212, 255, 0.9);
+            background: rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.12);
+            border-color: rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.5);
+            box-shadow: inset 3px 0 0 rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.9);
           }
           .card-hover {
             transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
           }
           .card-hover:hover {
             transform: translateY(-4px);
-            border-color: rgba(99, 212, 255, 0.3);
+            border-color: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.3);
             box-shadow: 0 28px 80px rgba(0, 0, 0, 0.45);
           }
           .accent-text {
-            color: var(--accent-strong);
+            color: var(--sagitta-blue-muted, #7AA1C2);
           }
           .cta-outline {
             border: 1px solid rgba(255, 255, 255, 0.25);
@@ -226,8 +218,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
           }
           .cta-outline:hover {
-            border-color: rgba(99, 212, 255, 0.5);
-            background: rgba(99, 212, 255, 0.1);
+            border-color: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.5);
+            background: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.1);
             transform: translateY(-1px);
           }
           .cta-btn {
@@ -267,7 +259,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           }
           .note-card:hover {
             transform: translateY(-3px);
-            border-color: rgba(99, 212, 255, 0.3);
+            border-color: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.3);
             box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
           }
           .note-drawer-overlay {
@@ -281,7 +273,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           .note-drawer {
             width: min(720px, 100%);
             height: 100%;
-            background: #0b0f14;
+            background: #0b0b0b;
             border-left: 1px solid rgba(255, 255, 255, 0.12);
             box-shadow: -24px 0 80px rgba(0, 0, 0, 0.6);
           }
@@ -335,8 +327,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             font-weight: 600;
           }
           .note-button:hover {
-            border-color: rgba(99, 212, 255, 0.5);
-            background: rgba(99, 212, 255, 0.12);
+            border-color: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.5);
+            background: rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.12);
           }
           .note-audio {
             padding: 12px 28px 0;
@@ -383,7 +375,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             color: rgba(255, 255, 255, 0.6);
           }
           .note-toc-link:hover {
-            color: var(--accent-strong);
+            color: var(--sagitta-blue, #63D4FF);
           }
           .note-toc-mobile {
             display: none;

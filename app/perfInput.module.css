@@ -18,6 +18,6 @@
 
 /* focus outline / glow (blue) */
 .perfInput:focus {
-  border-color: #1e90ff;
-  box-shadow: 0 0 0 4px rgba(30, 144, 255, 0.18);
+  border-color: var(--sagitta-blue, #63D4FF);
+  box-shadow: 0 0 0 4px rgba(var(--sagitta-blue-rgb, 99, 212, 255), 0.18);
 }
