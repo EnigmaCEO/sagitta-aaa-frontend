@@ -583,6 +583,9 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
                 </div>
                 <div>Status: {mfaStatusText}</div>
                 <div className="flex items-center gap-3">
+                  <span className="text-sm text-white/70">
+                    {mfaSwitchOn ? "Disable MFA" : "Enable MFA"}
+                  </span>
                   <button
                     type="button"
                     role="switch"
@@ -595,6 +598,8 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
                       opacity: mfaSwitchDisabled ? 0.5 : 1,
                       background: mfaSwitchOn ? "var(--sagitta-blue, #63D4FF)" : "rgba(255,255,255,0.06)",
                       borderColor: mfaSwitchOn ? "var(--sagitta-blue, #63D4FF)" : "rgba(255,255,255,0.15)",
+                      marginLeft: 10,
+                      width:"50px",
                     }}
                   >
                     <span
@@ -613,7 +618,7 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
                 ) : null}
                 {mfaNotice ? <div className="text-xs text-emerald-200">{mfaNotice}</div> : null}
                 {mfaError ? <div className="text-xs text-red-200">{shortMessage(mfaError, 90)}</div> : null}
-                <div>MFA is managed by Auth0.</div>
+                <div style={{ marginTop: 20 }}>MFA is managed by Auth0.</div>
                 <div className="text-xs text-white/50">
                   Auth0 may ask you to verify your identity.
                 </div>

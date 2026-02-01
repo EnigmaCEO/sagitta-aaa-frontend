@@ -4690,7 +4690,7 @@ export default function Page() {
 
                 {/* CHANGE: center the button, but keep it on its own row */}
                 <div style={{ display: "flex", justifyContent: "center", marginTop: 12 }}>
-                  <button className="btn-primary" onClick={onRunAbComparison} disabled={loading} style={{ minWidth: 320 }}>
+                  <button className="btn-primary" onClick={onRunAbComparison} disabled={loading || isPortfolioBlank} style={{ minWidth: 320 }}>
                     Run A/B Allocation Comparison
                   </button>
                 </div>
