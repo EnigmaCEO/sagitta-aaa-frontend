@@ -40,9 +40,10 @@ export default async function AccountPage() {
     redirect("/auth/login?returnTo=/account");
   }
 
+  const sessionUser = session.user as Record<string, unknown>;
   const user = {
-    sub: typeof session.user.sub === "string" ? session.user.sub : "",
-    email: typeof session.user.email === "string" ? session.user.email : null,
+    sub: typeof sessionUser.sub === "string" ? sessionUser.sub : "",
+    email: typeof sessionUser.email === "string" ? sessionUser.email : null,
   };
 
   const base = process.env.AAA_API_BASE_URL;

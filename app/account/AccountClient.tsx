@@ -97,6 +97,10 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
   const [portalError, setPortalError] = useState<string | null>(null);
   const [upgradeLoading, setUpgradeLoading] = useState(false);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
+  const [mfaPref, setMfaPref] = useState<boolean | null>(null);
+  const [mfaPrefLoading, setMfaPrefLoading] = useState(false);
+  const [mfaPrefSaving, setMfaPrefSaving] = useState(false);
+  const [mfaPrefError, setMfaPrefError] = useState<string | null>(null);
 
   useEffect(() => {
     if (summary) {
@@ -136,6 +140,39 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
       cancelled = true;
     };
   }, [summary]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setMfaPrefLoading(true);
+        const res = await fetch("/api/account/mfa", { cache: "no-store" });
+        if (res.status === 401 || res.status === 403) {
+          window.location.assign("/auth/login?returnTo=/account");
+          return;
+        }
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          if (!cancelled) setMfaPrefError(text || `Failed to load MFA preference (${res.status})`);
+          return;
+        }
+        const data = (await res.json()) as { enabled?: boolean | null };
+        if (!cancelled) {
+          setMfaPref(typeof data.enabled === "boolean" ? data.enabled : null);
+          setMfaPrefError(null);
+        }
+      } catch (err: unknown) {
+        if (!cancelled) {
+          setMfaPrefError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (!cancelled) setMfaPrefLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const authority = summary?.authority_level ?? 0;
   const accountId = summary?.account?.account_id ?? null;
@@ -244,28 +281,10 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
     try {
       setUpgradeLoading(true);
       setUpgradeError(null);
-      const res = await fetch("/api/billing/checkout", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ plan_key: "sandbox" }),
-      });
-      if (res.status === 401 || res.status === 403) {
-        window.location.assign("/auth/login?returnTo=/account");
-        return;
+      // Start checkout by navigating to the billing page for the sandbox plan
+      if (typeof window !== "undefined") {
+        window.location.assign("/billing?plan_key=sandbox");
       }
-      const contentType = res.headers.get("content-type") || "";
-      const payload = contentType.includes("application/json") ? await res.json().catch(() => null) : null;
-      if (!res.ok) {
-        const err = payload && typeof payload.error === "string" ? payload.error : "";
-        setUpgradeError(err || "Unable to start checkout.");
-        return;
-      }
-      const url = payload && typeof payload.url === "string" ? payload.url : "";
-      if (!url) {
-        setUpgradeError("Checkout response did not include a URL.");
-        return;
-      }
-      window.location.assign(url);
     } catch (err: unknown) {
       setUpgradeError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -281,9 +300,94 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
     }
   }, [router]);
 
-  const handleManageMfa = useCallback(() => {
-    window.location.assign("/api/auth/reauth");
+  const confirmMfaPreference = useCallback(async (expected: boolean) => {
+    for (let i = 0; i < 3; i += 1) {
+      try {
+        const res = await fetch("/api/account/mfa", { cache: "no-store" });
+        if (res.ok) {
+          const data = (await res.json()) as { enabled?: boolean | null };
+          if (data.enabled === expected) {
+            return true;
+          }
+        }
+      } catch {
+        // ignore and retry
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    return false;
   }, []);
+
+  const handleSetMfa = useCallback(async (nextEnabled: boolean, redirectAfter = false) => {
+    if (isInvoice && nextEnabled === false) {
+      setMfaPrefError("MFA is required for this authority.");
+      return false;
+    }
+    try {
+      setMfaPrefSaving(true);
+      setMfaPrefError(null);
+      const res = await fetch("/api/account/mfa", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: nextEnabled }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        window.location.assign("/auth/login?returnTo=/account");
+        return;
+      }
+      const payload = (await res.json().catch(() => null)) as { enabled?: boolean; error?: string } | null;
+      if (!res.ok) {
+        if (res.status === 409 && payload?.error === "mfa_required") {
+          setMfaPrefError("MFA is required for this authority.");
+          return false;
+        }
+        if (res.status === 409 && payload?.error === "mfa_not_persisted") {
+          const reported = typeof payload.enabled === "boolean" ? payload.enabled : null;
+          if (reported !== null) {
+            setMfaPref(reported);
+          }
+          setMfaPrefError("MFA preference did not persist yet. Try again.");
+          return false;
+        }
+        setMfaPrefError(payload?.error || `Failed to update MFA (${res.status})`);
+        return false;
+      }
+      const enabledValue = typeof payload?.enabled === "boolean" ? payload.enabled : nextEnabled;
+      setMfaPref(enabledValue);
+      if (redirectAfter && enabledValue) {
+        const confirmed = await confirmMfaPreference(true);
+        if (!confirmed) {
+          setMfaPrefError("MFA preference did not persist yet. Try again.");
+          return false;
+        }
+        window.location.assign("/api/auth/reauth?mfa=1");
+      }
+      return true;
+    } catch (err: unknown) {
+      setMfaPrefError(err instanceof Error ? err.message : String(err));
+      return false;
+    } finally {
+      setMfaPrefSaving(false);
+    }
+  }, [confirmMfaPreference, isInvoice]);
+
+  const handleManageMfa = useCallback(() => {
+    if (mfaPref === true) {
+      window.location.assign("/api/auth/reauth?mfa=1");
+      return;
+    }
+    void handleSetMfa(true, true);
+  }, [handleSetMfa, mfaPref]);
+
+  const mfaStatusLabel = useMemo(() => {
+    if (summary?.security?.mfa_enrolled === true) return "MFA enabled";
+    if (summary?.security?.mfa_enrolled === false) return "MFA not enabled yet";
+    return null;
+  }, [summary]);
+
+  const mfaEnabled = mfaPref === true;
+  const mfaPrefLabel =
+    mfaPref === null ? "Not set" : mfaEnabled ? "On" : "Off";
 
   return (
     <div className="note-drawer-overlay" role="presentation" onClick={handleClose}>
@@ -469,7 +573,30 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
                 <div>
                   {isInvoice ? "MFA required for this authority." : "MFA optional."}
                 </div>
+                {mfaStatusLabel ? <div>{mfaStatusLabel}</div> : null}
                 <div>MFA is managed by Auth0.</div>
+                {mfaPrefLoading ? (
+                  <div className="text-xs text-white/50">Loading MFA preference...</div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label className="flex items-center gap-2 text-sm text-white/70">
+                      <input
+                        type="checkbox"
+                        checked={mfaEnabled}
+                        onChange={(event) => handleSetMfa(event.target.checked, event.target.checked)}
+                        disabled={mfaPrefSaving || (isInvoice && mfaEnabled)}
+                        style={{ accentColor: "var(--sagitta-blue, #63D4FF)" }}
+                      />
+                    <span>MFA: {mfaPrefLabel}</span>
+                  </label>
+                    {mfaPrefSaving ? (
+                      <span className="text-xs text-white/50">Updating...</span>
+                    ) : null}
+                  </div>
+                )}
+                {mfaPrefError ? (
+                  <div className="text-xs text-red-200">{mfaPrefError}</div>
+                ) : null}
               </div>
               <div style={dividerStyle}>
                 <button onClick={handleManageMfa}>Manage MFA</button>
