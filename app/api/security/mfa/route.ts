@@ -62,7 +62,7 @@ async function mgmtFetch(path: string, init?: RequestInit) {
   const { domain } = getMgmtCreds();
   if (!domain) throw new Error("Missing AUTH0_DOMAIN");
   const token = await getManagementToken();
-  const res = await fetch(`https://${domain}/api/v2/${path}`, {
+  return fetch(`https://${domain}/api/v2/${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -71,7 +71,6 @@ async function mgmtFetch(path: string, init?: RequestInit) {
       ...(init?.headers || {}),
     },
   });
-  return res;
 }
 
 async function fetchAuthorityLevel(base: string, accessToken: string) {
@@ -93,10 +92,7 @@ async function fetchAuthorityLevel(base: string, accessToken: string) {
 }
 
 async function fetchUserProfile(userId: string) {
-  const res = await mgmtFetch(
-    `users/${encodeURIComponent(userId)}?fields=user_metadata,app_metadata&include_fields=true`,
-    { method: "GET" }
-  );
+  const res = await mgmtFetch(`users/${encodeURIComponent(userId)}`, { method: "GET" });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Failed to load user profile (${res.status}): ${text}`);
@@ -104,6 +100,7 @@ async function fetchUserProfile(userId: string) {
   return (await res.json()) as {
     user_metadata?: Record<string, unknown>;
     app_metadata?: Record<string, unknown>;
+    multifactor?: string[];
   };
 }
 
@@ -138,55 +135,51 @@ async function removeEnrolledFactors(userId: string, providers: string[]) {
   }
 }
 
-export async function GET(request: Request) {
-  const session = await auth0.getSession(request).catch(() => null);
-  if (!session || !session.user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-  const user = session.user as Record<string, unknown>;
-  const userId = typeof user.sub === "string" ? user.sub : "";
-  if (!userId) {
-    return NextResponse.json({ error: "Missing user id" }, { status: 400 });
-  }
-
-  try {
-    const profile = await fetchUserProfile(userId);
-    const enabled =
-      typeof profile.user_metadata?.use_mfa === "boolean"
-        ? profile.user_metadata.use_mfa
-        : typeof profile.app_metadata?.use_mfa === "boolean"
-        ? profile.app_metadata.use_mfa
-        : null;
-    return NextResponse.json({ enabled });
-  } catch (err: unknown) {
-    return NextResponse.json(
-      { error: "mfa_read_failed", detail: err instanceof Error ? err.message : String(err) },
-      { status: 502 }
-    );
-  }
+function buildReauthRedirect(requestUrl: string, action: "enable" | "disable") {
+  const url = new URL(requestUrl);
+  url.pathname = "/api/auth/reauth";
+  const params = new URLSearchParams({
+    returnTo: `/account?mfa_intent=${action}`,
+    mfa: "1",
+  });
+  url.search = params.toString();
+  return url.toString();
 }
 
 export async function POST(request: Request) {
   const session = await auth0.getSession(request).catch(() => null);
   if (!session || !session.user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return NextResponse.json({ ok: false, error: "unauthorized", message: "Unauthorized" }, { status: 401 });
   }
-  const user = session.user as Record<string, unknown>;
-  const userId = typeof user.sub === "string" ? user.sub : "";
+  const sessionUser = session.user as Record<string, unknown>;
+  const userId = typeof sessionUser.sub === "string" ? sessionUser.sub : "";
   if (!userId) {
-    return NextResponse.json({ error: "Missing user id" }, { status: 400 });
+    return NextResponse.json({ ok: false, error: "missing_user_id", message: "Missing user id" }, { status: 400 });
   }
 
-  let enabled: boolean | null = null;
+  let body: { action?: string; confirmed?: boolean } = {};
   try {
-    const body = (await request.json()) as { enabled?: boolean };
-    enabled = typeof body.enabled === "boolean" ? body.enabled : null;
+    body = (await request.json()) as { action?: string; confirmed?: boolean };
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return NextResponse.json({ ok: false, error: "invalid_json", message: "Invalid JSON body" }, { status: 400 });
   }
 
-  if (enabled === null) {
-    return NextResponse.json({ error: "Missing enabled boolean" }, { status: 400 });
+  const action = body.action === "enable" || body.action === "disable" ? body.action : null;
+  if (!action) {
+    return NextResponse.json({ ok: false, error: "invalid_action", message: "Missing or invalid action" }, { status: 400 });
+  }
+
+  const confirmed = body.confirmed === true;
+  const maxAge = Number(process.env.MFA_STEPUP_MAX_AGE_SECONDS ?? "0");
+  const authTime = typeof sessionUser.auth_time === "number" ? sessionUser.auth_time : null;
+  if (!confirmed && maxAge > 0 && authTime) {
+    const now = Math.floor(Date.now() / 1000);
+    if (now - authTime > maxAge) {
+      return NextResponse.json(
+        { ok: false, requires_reauth: true, redirect_to: buildReauthRedirect(request.url, action) },
+        { status: 200 }
+      );
+    }
   }
 
   try {
@@ -203,38 +196,24 @@ export async function POST(request: Request) {
     if (!Number.isFinite(authorityLevel)) {
       authorityLevel = 0;
     }
-    if (authorityLevel >= 2 && enabled === false) {
-      return NextResponse.json({ error: "mfa_required" }, { status: 409 });
+    if (authorityLevel >= 2 && action === "disable") {
+      return NextResponse.json({ ok: false, error: "mfa_required", message: "MFA is required for this authority." }, { status: 409 });
     }
 
-    const userMetadata = { ...(profile.user_metadata || {}), use_mfa: enabled };
-    const appMetadata = { ...(profile.app_metadata || {}), use_mfa: enabled };
+    const enable = action === "enable";
+    const userMetadata = { ...(profile.user_metadata || {}), use_mfa: enable };
+    const appMetadata = { ...(profile.app_metadata || {}), use_mfa: enable };
     await updateUserMetadata(userId, userMetadata, appMetadata);
 
-    if (!enabled) {
+    if (!enable) {
       const fallback = ["guardian", "google-authenticator", "duo", "sms", "email", "otp"];
       await removeEnrolledFactors(userId, fallback);
     }
 
-    const confirmed = await fetchUserProfile(userId);
-    const confirmedEnabled =
-      typeof confirmed.user_metadata?.use_mfa === "boolean"
-        ? confirmed.user_metadata.use_mfa
-        : typeof confirmed.app_metadata?.use_mfa === "boolean"
-        ? confirmed.app_metadata.use_mfa
-        : null;
-
-    if (confirmedEnabled !== enabled) {
-      return NextResponse.json(
-        { error: "mfa_not_persisted", enabled: confirmedEnabled },
-        { status: 409 }
-      );
-    }
-
-    return NextResponse.json({ enabled: confirmedEnabled });
+    return NextResponse.json({ ok: true, status: enable ? "enabled" : "disabled" });
   } catch (err: unknown) {
     return NextResponse.json(
-      { error: "mfa_update_failed", detail: err instanceof Error ? err.message : String(err) },
+      { ok: false, error: "mfa_update_failed", message: "MFA update failed." },
       { status: 502 }
     );
   }

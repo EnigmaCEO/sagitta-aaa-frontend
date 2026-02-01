@@ -16,15 +16,99 @@ type Summary = {
   };
   security: {
     mfa_required: boolean;
+    mfa_enabled: boolean | null;
     mfa_enrolled?: boolean | null;
   };
 };
 
-function inferMfaEnrolled(user: Record<string, unknown>): boolean | null {
-  const amr = user["amr"];
-  if (!Array.isArray(amr)) return null;
-  const values = amr.map((v) => String(v).toLowerCase());
-  return values.some((v) => ["mfa", "otp", "sms", "totp", "ga"].includes(v));
+type MgmtToken = { token: string; exp: number };
+let cachedToken: MgmtToken | null = null;
+
+function resolveAuth0Domain() {
+  const issuer = (process.env.AUTH0_ISSUER_BASE_URL || "").trim();
+  if (issuer) {
+    return issuer.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  }
+  return (process.env.AUTH0_DOMAIN || "").trim();
+}
+
+function getMgmtCreds() {
+  const domain = resolveAuth0Domain();
+  const clientId = (process.env.AUTH0_MGMT_CLIENT_ID || process.env.AUTH0_M2M_CLIENT_ID || "").trim();
+  const clientSecret = (process.env.AUTH0_MGMT_CLIENT_SECRET || process.env.AUTH0_M2M_CLIENT_SECRET || "").trim();
+  return { domain, clientId, clientSecret };
+}
+
+async function getManagementToken() {
+  if (cachedToken && cachedToken.exp > Date.now() + 60_000) {
+    return cachedToken.token;
+  }
+  const { domain, clientId, clientSecret } = getMgmtCreds();
+  if (!domain || !clientId || !clientSecret) {
+    throw new Error("Missing AUTH0_DOMAIN or management client credentials");
+  }
+
+  const res = await fetch(`https://${domain}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: clientId,
+      client_secret: clientSecret,
+      audience: `https://${domain}/api/v2/`,
+      scope: "read:users",
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Failed to obtain management token (${res.status}): ${text}`);
+  }
+
+  const data = (await res.json()) as { access_token?: string; expires_in?: number };
+  const token = data.access_token || "";
+  const expiresIn = Number(data.expires_in ?? 0);
+  if (!token || !expiresIn) {
+    throw new Error("Invalid management token response");
+  }
+
+  cachedToken = { token, exp: Date.now() + expiresIn * 1000 };
+  return token;
+}
+
+async function mgmtFetch(path: string, init?: RequestInit) {
+  const { domain } = getMgmtCreds();
+  if (!domain) throw new Error("Missing AUTH0_DOMAIN");
+  const token = await getManagementToken();
+  const res = await fetch(`https://${domain}/api/v2/${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(init?.headers || {}),
+    },
+  });
+  return res;
+}
+
+async function fetchMfaEnrolled(userId: string): Promise<boolean | null> {
+  const res = await mgmtFetch(`users/${encodeURIComponent(userId)}`, { method: "GET" });
+  if (!res.ok) return null;
+  const data = (await res.json()) as Record<string, unknown>;
+  const multifactor = data["multifactor"];
+  if (Array.isArray(multifactor) && multifactor.length > 0) {
+    return true;
+  }
+  const userMetadata = data["user_metadata"] as Record<string, unknown> | undefined;
+  const appMetadata = data["app_metadata"] as Record<string, unknown> | undefined;
+  const metaValue =
+    typeof userMetadata?.use_mfa === "boolean"
+      ? userMetadata.use_mfa
+      : typeof appMetadata?.use_mfa === "boolean"
+      ? appMetadata.use_mfa
+      : null;
+  return metaValue;
 }
 
 export async function GET(request: Request) {
@@ -97,6 +181,7 @@ export async function GET(request: Request) {
     // ignore
   }
 
+  const mfaEnabled = user.sub ? await fetchMfaEnrolled(user.sub).catch(() => null) : null;
   const summary: Summary = {
     user,
     account: { account_id },
@@ -105,7 +190,8 @@ export async function GET(request: Request) {
     billing,
     security: {
       mfa_required: authority_level >= 2,
-      mfa_enrolled: inferMfaEnrolled(session.user as Record<string, unknown>),
+      mfa_enabled: mfaEnabled,
+      mfa_enrolled: mfaEnabled,
     },
   };
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 type AccountSummary = {
@@ -21,6 +21,7 @@ type AccountSummary = {
   };
   security: {
     mfa_required: boolean;
+    mfa_enabled?: boolean | null;
     mfa_enrolled?: boolean | null;
   };
 };
@@ -60,6 +61,11 @@ function formatDate(value?: string | null) {
   return dt.toLocaleDateString();
 }
 
+function shortMessage(value: string, max = 120) {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max - 3)}...`;
+}
+
 export default function AccountClient({ initialUser, initialSummary = null }: Props) {
   const router = useRouter();
   const cardStyle = {
@@ -97,10 +103,40 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
   const [portalError, setPortalError] = useState<string | null>(null);
   const [upgradeLoading, setUpgradeLoading] = useState(false);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
-  const [mfaPref, setMfaPref] = useState<boolean | null>(null);
-  const [mfaPrefLoading, setMfaPrefLoading] = useState(false);
-  const [mfaPrefSaving, setMfaPrefSaving] = useState(false);
-  const [mfaPrefError, setMfaPrefError] = useState<string | null>(null);
+  const [mfaEnabled, setMfaEnabled] = useState<boolean | null>(
+    initialSummary?.security?.mfa_enabled ?? initialSummary?.security?.mfa_enrolled ?? null
+  );
+  const [mfaSaving, setMfaSaving] = useState(false);
+  const [mfaError, setMfaError] = useState<string | null>(null);
+  const [mfaNotice, setMfaNotice] = useState<string | null>(null);
+  const [mfaConfirmOpen, setMfaConfirmOpen] = useState(false);
+  const [mfaPendingAction, setMfaPendingAction] = useState<"enable" | "disable" | null>(null);
+  const intentHandledRef = useRef(false);
+
+  const loadSummary = useCallback(async () => {
+    try {
+      setLoading(true);
+      const res = await fetch("/api/account/summary", { cache: "no-store" });
+      if (res.status === 401 || res.status === 403) {
+        window.location.assign("/auth/login?returnTo=/account");
+        return null;
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        setError(text || `Failed to load account summary (${res.status})`);
+        return null;
+      }
+      const data = (await res.json()) as AccountSummary;
+      setSummary(data);
+      setError(null);
+      return data;
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (summary) {
@@ -109,69 +145,62 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
     }
     let cancelled = false;
     (async () => {
-      try {
-        setLoading(true);
-        const res = await fetch("/api/account/summary", { cache: "no-store" });
-        if (res.status === 401 || res.status === 403) {
-          window.location.assign("/auth/login?returnTo=/account");
-          return;
-        }
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          if (!cancelled) {
-            setError(text || `Failed to load account summary (${res.status})`);
-          }
-          return;
-        }
-        const data = (await res.json()) as AccountSummary;
-        if (!cancelled) {
-          setSummary(data);
-          setError(null);
-        }
-      } catch (err: unknown) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err));
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+      if (cancelled) return;
+      await loadSummary();
     })();
     return () => {
       cancelled = true;
     };
+  }, [summary, loadSummary]);
+
+  useEffect(() => {
+    if (!summary) return;
+    const next =
+      summary.security?.mfa_enabled ?? summary.security?.mfa_enrolled ?? null;
+    setMfaEnabled(next);
   }, [summary]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        setMfaPrefLoading(true);
         const res = await fetch("/api/account/mfa", { cache: "no-store" });
         if (res.status === 401 || res.status === 403) {
           window.location.assign("/auth/login?returnTo=/account");
           return;
         }
         if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          if (!cancelled) setMfaPrefError(text || `Failed to load MFA preference (${res.status})`);
           return;
         }
-        const data = (await res.json()) as { enabled?: boolean | null };
-        if (!cancelled) {
-          setMfaPref(typeof data.enabled === "boolean" ? data.enabled : null);
-          setMfaPrefError(null);
+        const payload = (await res.json().catch(() => null)) as { enabled?: boolean } | null;
+        const enabled = typeof payload?.enabled === "boolean" ? payload.enabled : null;
+        if (!cancelled && enabled !== null) {
+          setMfaEnabled(enabled);
         }
-      } catch (err: unknown) {
-        if (!cancelled) {
-          setMfaPrefError(err instanceof Error ? err.message : String(err));
-        }
-      } finally {
-        if (!cancelled) setMfaPrefLoading(false);
+      } catch {
+        // ignore: keep last known status
       }
     })();
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (intentHandledRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const intent = params.get("mfa_intent");
+    if (intent !== "enable" && intent !== "disable") return;
+    intentHandledRef.current = true;
+    params.delete("mfa_intent");
+    const nextUrl = params.toString()
+      ? `${window.location.pathname}?${params.toString()}`
+      : window.location.pathname;
+    window.history.replaceState(null, "", nextUrl);
+    setMfaNotice(null);
+    setMfaError(null);
+    void performMfaAction(intent, { confirmed: true });
   }, []);
 
   const authority = summary?.authority_level ?? 0;
@@ -293,101 +322,80 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
   }, []);
 
   const handleClose = useCallback(() => {
-    if (typeof window !== "undefined" && window.history.length > 1) {
-      router.back();
-    } else {
-      router.push("/app");
-    }
+    
+    router.push("/app");
+    
   }, [router]);
 
-  const confirmMfaPreference = useCallback(async (expected: boolean) => {
-    for (let i = 0; i < 3; i += 1) {
+  const performMfaAction = useCallback(
+    async (action: "enable" | "disable", opts?: { confirmed?: boolean }) => {
       try {
-        const res = await fetch("/api/account/mfa", { cache: "no-store" });
-        if (res.ok) {
-          const data = (await res.json()) as { enabled?: boolean | null };
-          if (data.enabled === expected) {
-            return true;
-          }
+        setMfaSaving(true);
+        setMfaError(null);
+        setMfaNotice(null);
+        const res = await fetch("/api/security/mfa", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, confirmed: opts?.confirmed }),
+        });
+        if (res.status === 401 || res.status === 403) {
+          window.location.assign("/auth/login?returnTo=/account");
+          return;
         }
-      } catch {
-        // ignore and retry
+        const payload = (await res.json().catch(() => null)) as
+          | { ok?: boolean; status?: string; requires_reauth?: boolean; redirect_to?: string; error?: string; message?: string }
+          | null;
+        if (payload?.requires_reauth && payload.redirect_to) {
+          window.location.assign(payload.redirect_to);
+          return;
+        }
+        if (!res.ok || payload?.ok === false) {
+          if (res.status === 409 && payload?.error === "mfa_required") {
+            setMfaError("MFA is required for this authority.");
+            return;
+          }
+          setMfaError("Unable to update MFA. Try again.");
+          return;
+        }
+        const nextEnabled = payload?.status === "enabled" ? true : payload?.status === "disabled" ? false : action === "enable";
+        setMfaEnabled(nextEnabled);
+        setMfaNotice(nextEnabled ? "MFA enabled." : "MFA disabled.");
+        await loadSummary();
+      } catch (err: unknown) {
+        setMfaError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setMfaSaving(false);
       }
-      await new Promise((resolve) => setTimeout(resolve, 300));
-    }
-    return false;
+    },
+    [loadSummary]
+  );
+
+  const openMfaConfirm = useCallback((action: "enable" | "disable") => {
+    setMfaPendingAction(action);
+    setMfaConfirmOpen(true);
   }, []);
 
-  const handleSetMfa = useCallback(async (nextEnabled: boolean, redirectAfter = false) => {
-    if (isInvoice && nextEnabled === false) {
-      setMfaPrefError("MFA is required for this authority.");
-      return false;
-    }
-    try {
-      setMfaPrefSaving(true);
-      setMfaPrefError(null);
-      const res = await fetch("/api/account/mfa", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: nextEnabled }),
-      });
-      if (res.status === 401 || res.status === 403) {
-        window.location.assign("/auth/login?returnTo=/account");
-        return;
-      }
-      const payload = (await res.json().catch(() => null)) as { enabled?: boolean; error?: string } | null;
-      if (!res.ok) {
-        if (res.status === 409 && payload?.error === "mfa_required") {
-          setMfaPrefError("MFA is required for this authority.");
-          return false;
-        }
-        if (res.status === 409 && payload?.error === "mfa_not_persisted") {
-          const reported = typeof payload.enabled === "boolean" ? payload.enabled : null;
-          if (reported !== null) {
-            setMfaPref(reported);
-          }
-          setMfaPrefError("MFA preference did not persist yet. Try again.");
-          return false;
-        }
-        setMfaPrefError(payload?.error || `Failed to update MFA (${res.status})`);
-        return false;
-      }
-      const enabledValue = typeof payload?.enabled === "boolean" ? payload.enabled : nextEnabled;
-      setMfaPref(enabledValue);
-      if (redirectAfter && enabledValue) {
-        const confirmed = await confirmMfaPreference(true);
-        if (!confirmed) {
-          setMfaPrefError("MFA preference did not persist yet. Try again.");
-          return false;
-        }
-        window.location.assign("/api/auth/reauth?mfa=1");
-      }
-      return true;
-    } catch (err: unknown) {
-      setMfaPrefError(err instanceof Error ? err.message : String(err));
-      return false;
-    } finally {
-      setMfaPrefSaving(false);
-    }
-  }, [confirmMfaPreference, isInvoice]);
+  const closeMfaConfirm = useCallback(() => {
+    setMfaConfirmOpen(false);
+    setMfaPendingAction(null);
+  }, []);
 
-  const handleManageMfa = useCallback(() => {
-    if (mfaPref === true) {
-      window.location.assign("/api/auth/reauth?mfa=1");
-      return;
-    }
-    void handleSetMfa(true, true);
-  }, [handleSetMfa, mfaPref]);
+  const handleToggleMfa = useCallback(() => {
+    if (mfaSaving) return;
+    if (mfaEnabled === null) return;
+    openMfaConfirm(mfaEnabled ? "disable" : "enable");
+  }, [mfaEnabled, mfaSaving, openMfaConfirm]);
 
-  const mfaStatusLabel = useMemo(() => {
-    if (summary?.security?.mfa_enrolled === true) return "MFA enabled";
-    if (summary?.security?.mfa_enrolled === false) return "MFA not enabled yet";
-    return null;
-  }, [summary]);
+  const handleConfirmMfa = useCallback(() => {
+    if (!mfaPendingAction) return;
+    closeMfaConfirm();
+    void performMfaAction(mfaPendingAction);
+  }, [mfaPendingAction, closeMfaConfirm, performMfaAction]);
 
-  const mfaEnabled = mfaPref === true;
-  const mfaPrefLabel =
-    mfaPref === null ? "Not set" : mfaEnabled ? "On" : "Off";
+  const mfaKnown = mfaEnabled !== null;
+  const mfaStatusText = mfaKnown ? (mfaEnabled ? "Enabled" : "Disabled") : "Unknown";
+  const mfaSwitchOn = mfaEnabled === true;
+  const mfaSwitchDisabled = !mfaKnown || mfaSaving;
 
   return (
     <div className="note-drawer-overlay" role="presentation" onClick={handleClose}>
@@ -492,7 +500,7 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
               <div className="text-sm text-white/60">Loading account summary...</div>
             ) : null}
             {error ? (
-              <div className="text-sm text-red-200">Error: {error}</div>
+              <div className="text-sm text-red-200">Error: {shortMessage(error)}</div>
             ) : null}
 
             <section style={cardStyle}>
@@ -571,38 +579,98 @@ export default function AccountClient({ initialUser, initialSummary = null }: Pr
               <div style={sectionTitleStyle}>Security</div>
               <div style={sectionBodyStyle}>
                 <div>
-                  {isInvoice ? "MFA required for this authority." : "MFA optional."}
+                  {isInvoice ? "MFA required for this authority." : "MFA recommended."}
                 </div>
-                {mfaStatusLabel ? <div>{mfaStatusLabel}</div> : null}
-                <div>MFA is managed by Auth0.</div>
-                {mfaPrefLoading ? (
-                  <div className="text-xs text-white/50">Loading MFA preference...</div>
-                ) : (
-                  <div className="flex flex-wrap items-center gap-3">
-                    <label className="flex items-center gap-2 text-sm text-white/70">
-                      <input
-                        type="checkbox"
-                        checked={mfaEnabled}
-                        onChange={(event) => handleSetMfa(event.target.checked, event.target.checked)}
-                        disabled={mfaPrefSaving || (isInvoice && mfaEnabled)}
-                        style={{ accentColor: "var(--sagitta-blue, #63D4FF)" }}
-                      />
-                    <span>MFA: {mfaPrefLabel}</span>
-                  </label>
-                    {mfaPrefSaving ? (
-                      <span className="text-xs text-white/50">Updating...</span>
-                    ) : null}
-                  </div>
-                )}
-                {mfaPrefError ? (
-                  <div className="text-xs text-red-200">{mfaPrefError}</div>
+                <div>Status: {mfaStatusText}</div>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={mfaSwitchOn}
+                    onClick={handleToggleMfa}
+                    disabled={mfaSwitchDisabled}
+                    className="relative inline-flex h-6 w-11 items-center rounded-full border transition"
+                    style={{
+                      cursor: mfaSwitchDisabled ? "not-allowed" : "pointer",
+                      opacity: mfaSwitchDisabled ? 0.5 : 1,
+                      background: mfaSwitchOn ? "var(--sagitta-blue, #63D4FF)" : "rgba(255,255,255,0.06)",
+                      borderColor: mfaSwitchOn ? "var(--sagitta-blue, #63D4FF)" : "rgba(255,255,255,0.15)",
+                    }}
+                  >
+                    <span
+                      className="inline-block h-5 w-5 transform rounded-full bg-white transition"
+                      style={{
+                        transform: mfaSwitchOn ? "translateX(20px)" : "translateX(2px)",
+                      }}
+                    />
+                  </button>
+                  {mfaSaving ? (
+                    <span className="text-xs text-white/50">Updating...</span>
+                  ) : null}
+                </div>
+                {!mfaKnown ? (
+                  <div className="text-xs text-white/50">Status unavailable. Sign in again to refresh.</div>
                 ) : null}
-              </div>
-              <div style={dividerStyle}>
-                <button onClick={handleManageMfa}>Manage MFA</button>
+                {mfaNotice ? <div className="text-xs text-emerald-200">{mfaNotice}</div> : null}
+                {mfaError ? <div className="text-xs text-red-200">{shortMessage(mfaError, 90)}</div> : null}
+                <div>MFA is managed by Auth0.</div>
+                <div className="text-xs text-white/50">
+                  Auth0 may ask you to verify your identity.
+                </div>
               </div>
             </section>
           </div>
+          {mfaConfirmOpen ? (
+            <div
+              role="presentation"
+              onClick={closeMfaConfirm}
+              style={{
+                position: "fixed",
+                inset: 0,
+                background: "rgba(0,0,0,0.55)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                zIndex: 60,
+              }}
+            >
+              <div
+                role="dialog"
+                aria-modal="true"
+                aria-label="Change MFA setting"
+                onClick={(event) => event.stopPropagation()}
+                style={{
+                  width: "min(420px, 92vw)",
+                  borderRadius: 12,
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  background: "#111",
+                  padding: 20,
+                  boxShadow: "0 20px 40px rgba(0,0,0,0.5)",
+                  color: "rgba(255,255,255,0.9)",
+                }}
+              >
+                <div style={{ fontSize: 16, fontWeight: 600 }}>Change MFA setting</div>
+                <div className="text-sm text-white/70" style={{ marginTop: 8 }}>
+                  {mfaPendingAction === "enable"
+                    ? "Enable multi-factor authentication for your account?"
+                    : "Disable multi-factor authentication? This reduces account security."}
+                </div>
+                <div style={{ marginTop: 16, display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                  <button type="button" className="note-button focus-ring" onClick={closeMfaConfirm}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={handleConfirmMfa}
+                    disabled={mfaSaving}
+                  >
+                    Continue
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
