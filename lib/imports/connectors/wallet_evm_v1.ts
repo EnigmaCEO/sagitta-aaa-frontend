@@ -193,7 +193,7 @@ function isPositiveBalance(balance: unknown): boolean {
   if (typeof balance === "number") return Number.isFinite(balance) && balance > 0;
   if (typeof balance === "string") {
     try {
-      return BigInt(balance) > 0n;
+      return BigInt(balance) > BigInt(0);
     } catch {
       return false;
     }
@@ -709,7 +709,7 @@ function buildEtherscanPositions(
     const name = String(tx.tokenName || symbol).trim();
 
     const entry = balances.get(contract) || {
-      balance: 0n,
+      balance: BigInt(0),
       decimals: Number.isFinite(decimals) ? decimals : 18,
       symbol: symbol || "TOKEN",
       name: name || symbol || "Token",
@@ -722,7 +722,7 @@ function buildEtherscanPositions(
 
   const positions: ImportedRawPosition[] = [];
   for (const [contract, entry] of balances.entries()) {
-    if (entry.balance <= 0n) continue;
+    if (entry.balance <= BigInt(0)) continue;
     const quantity = balanceToNumber(entry.balance.toString(), entry.decimals);
     if (!quantity || !Number.isFinite(quantity)) continue;
     positions.push({
@@ -1411,7 +1411,9 @@ async function enrichWithCoinMarketCap(
     }
   }
 
-  const infoBySymbol = symbolSet.size ? await fetchCmcInfoBySymbol(Array.from(symbolSet), cfg) : new Map();
+  const infoBySymbol: Map<string, CmcInfoRecord[]> = symbolSet.size
+    ? await fetchCmcInfoBySymbol(Array.from(symbolSet), cfg)
+    : new Map<string, CmcInfoRecord[]>();
   const symbolAddressEntries = new Map<string, Array<{ address: string; platform?: string | null }>>();
   for (const [symbol, records] of infoBySymbol.entries()) {
     const entries: Array<{ address: string; platform?: string | null }> = [];
@@ -1443,9 +1445,9 @@ async function enrichWithCoinMarketCap(
     }
   }
 
-  const quotesBySymbol = verifiedSymbols.size
+  const quotesBySymbol: Map<string, CmcQuoteRecord[]> = verifiedSymbols.size
     ? await fetchCmcQuotesBySymbol(Array.from(verifiedSymbols), cfg)
-    : new Map();
+    : new Map<string, CmcQuoteRecord[]>();
 
   let pricedCount = 0;
   let symbolVerified = 0;

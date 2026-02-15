@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
 function localStorageKey(token: string) {
   return `decision_record_html:${token}`;
 }
 
-export default function DecisionRecordPrintPage() {
+function DecisionRecordPrintContent() {
   const searchParams = useSearchParams();
   const token = useMemo(() => searchParams.get("token") || "", [searchParams]);
   const [status, setStatus] = useState("Loading decision record...");
@@ -90,5 +90,32 @@ export default function DecisionRecordPrintPage() {
         <p style={{ margin: 0, fontSize: 14, color: "#9ca9bb" }}>{status}</p>
       </div>
     </main>
+  );
+}
+
+export default function DecisionRecordPrintPage() {
+  return (
+    <Suspense
+      fallback={
+        <main
+          style={{
+            minHeight: "100vh",
+            display: "grid",
+            placeItems: "center",
+            background: "#0b0b0b",
+            color: "#d2d7df",
+            fontFamily: "Arial, sans-serif",
+            padding: 24,
+          }}
+        >
+          <div style={{ maxWidth: 640, textAlign: "center" }}>
+            <h1 style={{ marginTop: 0, marginBottom: 12, fontSize: 24 }}>Sagitta Decision Record</h1>
+            <p style={{ margin: 0, fontSize: 14, color: "#9ca9bb" }}>Loading decision record...</p>
+          </div>
+        </main>
+      }
+    >
+      <DecisionRecordPrintContent />
+    </Suspense>
   );
 }
