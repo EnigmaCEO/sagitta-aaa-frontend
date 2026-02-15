@@ -39,9 +39,17 @@ export async function POST(req: Request) {
   };
 
   if (connectorId === "wallet_evm_v1") {
-    const base = (process.env.AAA_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "").trim();
+    const base = (process.env.AAA_API_BASE_URL || "").trim();
     if (!base) {
-      return runLocalPreview();
+      return Response.json(
+        {
+          ok: false,
+          summary: "Preview failed.",
+          warnings: [],
+          errors: ["AAA_API_BASE_URL is not configured on the frontend server."],
+        },
+        { status: 500 }
+      );
     }
     const targetUrl = `${base.replace(/\/+$/, "")}/wallet/import/preview`;
     try {
@@ -58,9 +66,6 @@ export async function POST(req: Request) {
         json = null;
       }
       if (!upstream.ok) {
-        if (upstream.status === 404) {
-          return runLocalPreview();
-        }
         return Response.json(
           {
             ok: false,
