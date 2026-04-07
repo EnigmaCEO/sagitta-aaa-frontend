@@ -265,9 +265,10 @@ const INSTITUTIONS: Institution[] = [
 ];
 
 const HERO_HIGHLIGHTS = [
-  { label: "Governance-first controls", icon: "shield" as IconName },
-  { label: "Constraint-bound allocators", icon: "layers" as IconName },
-  { label: "Audit-ready traces", icon: "file" as IconName },
+  { label: "Non-custodial", icon: "shield" as IconName },
+  { label: "Policy-enforced", icon: "layers" as IconName },
+  { label: "Audit-ready decision trails", icon: "file" as IconName },
+  { label: "Wallet-native portfolio import", icon: "wallet" as IconName },
 ];
 
 const FEATURES = [
@@ -296,12 +297,15 @@ const SECTION_LINKS = [
   { href: "#how-it-works", label: "How It Works" },
   { href: "#pricing", label: "Pricing" },
   { href: "#notes", label: "Research" },
+  { href: "/methodology", label: "Methodology" },
+  { href: "/security", label: "Security" },
+  { href: "/decision-records", label: "Decision Records" },
 ];
 
 const HERO_PROOF_POINTS = [
-  "Policy constraints are explicit, versioned, and enforced before allocation outputs are accepted.",
-  "Wallet-native import keeps portfolio state current without custody or execution permissions.",
-  "Every decision emits machine-auditable traces for review, replay, and governance defense.",
+  "Policy constraints are explicit, versioned, and enforced before any allocation output is accepted.",
+  "Non-custodial portfolio import keeps wallet state current with no signing permissions required.",
+  "Every allocation emits a machine-auditable decision record — replayable for governance and compliance defense.",
 ];
 
 const WORKFLOW_STEPS = [
@@ -334,6 +338,17 @@ const WORKFLOW_STEPS = [
     icon: "file" as IconName,
   },
 ];
+
+const NOTE_SUMMARIES: Record<string, string> = {
+  "determinism-discretion-and-trust-in-automated-allocation":
+    "Why deterministic allocation builds more institutional trust than intelligence alone — and why repeatability is the foundation of defensible decision-making.",
+  "authority-gated-decision-intelligence-in-crypto-native-institutions":
+    "How separating analysis from execution authority prevents the most common failure modes in crypto-native capital systems.",
+  "designing-enforceable-allocation-policy-for-decentralized-organizations":
+    "Why governance votes aren't policy until the system can constrain action — and how to design DAO treasury allocation that actually enforces mandate.",
+  "scenario-governance-in-on-chain-markets":
+    "How regime-aware posture shifts let institutions survive volatile market transitions without abandoning deterministic allocation rules.",
+};
 
 const SANDBOX_RETURN = "/billing?plan_key=sandbox";
 const SANDBOX_LOGIN = `/auth/login?returnTo=${encodeURIComponent(SANDBOX_RETURN)}`;
@@ -725,14 +740,13 @@ export default function MarketingPageClient() {
           ) : null}
           <section className="hero-grid" aria-labelledby="marketing-hero-title">
             <div>
-              <div className="pill">Authority-Gated Decision Intelligence</div>
-              <h1 id="marketing-hero-title" className="hero-title">Decision intelligence for crypto-native portfolio managers and DAOs</h1>
+              <div className="pill">AI crypto allocation agent for DAOs, treasury teams, and portfolio managers</div>
+              <h1 id="marketing-hero-title" className="hero-title">Policy-driven allocation intelligence for crypto-native treasuries and portfolios</h1>
               <p className="hero-subhead">
-                Model allocations, encode policy constraints, and generate auditable decisions across scenarios without custody or execution.
+                Sagitta AAA is a non-custodial allocation and risk engine that turns portfolio policy, governance rules, and market scenarios into deterministic, auditable decisions before execution.
               </p>
               <p className="hero-body">
-                Sagitta AAA gives teams a deterministic decision layer for allocation policy. Define constraints, import
-                live wallet state, run versioned allocators, and review auditable outputs before execution.
+                Define policy constraints, import live wallet state, run versioned allocators, and review complete decision records before anything reaches execution. Portfolio governance and risk controls that are enforced by the system, not dependent on individual judgment.
               </p>
               <div style={{ marginTop: 18, display: "grid", gap: 8, maxWidth: 900 }}>
                 {HERO_PROOF_POINTS.map((point) => (
@@ -743,15 +757,16 @@ export default function MarketingPageClient() {
                 ))}
               </div>
 
-              <div className="highlights-grid">
+              {/* Proof strip */}
+              <div style={{ marginTop: 24, display: "flex", flexWrap: "wrap", gap: 10 }}>
                 {HERO_HIGHLIGHTS.map((item) => (
                   <div
                     key={item.label}
-                    className="surface card-hover"
-                    style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px" }}
+                    className="surface"
+                    style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 14px", borderRadius: 10 }}
                   >
-                    <Icon name={item.icon} size={18} stroke={1.5} className="accent-text" />
-                    <span style={{ fontSize: 13, color: "rgba(255,255,255,0.86)" }}>{item.label}</span>
+                    <Icon name={item.icon} size={14} stroke={1.5} className="accent-text" />
+                    <span style={{ fontSize: 12, color: "rgba(255,255,255,0.82)", fontWeight: 500 }}>{item.label}</span>
                   </div>
                 ))}
               </div>
@@ -768,12 +783,9 @@ export default function MarketingPageClient() {
                     fontWeight: 700,
                   }}
                 >
-                  Launch evaluation
+                  Evaluate now
                 </a>
-                <a href="mailto:access@sagitta.systems" className="cta-outline focus-ring cta-btn" style={{ color: "#e6edf3" }}>
-                  Request access
-                </a>
-                <a href="#pricing" className="cta-outline focus-ring cta-btn" style={{ color: "#e6edf3" }}>
+                <a href="#pricing" className="cta-outline focus-ring cta-btn" style={{ color: "#e6edf3", textDecoration: "none" }}>
                   View pricing
                 </a>
                 <audio controls preload="none" style={{ width: "200px", height: "32px", alignSelf: "center" }}>
@@ -806,7 +818,8 @@ export default function MarketingPageClient() {
 
           <section id="institutions" className="section">
             <div className="section-title">Who It Serves</div>
-            <p className="section-lead">Authority-gated allocation for organizations that need policy discipline, not discretionary drift.</p>
+            <p className="section-lead">Built for DAOs, treasury operators, crypto funds, and portfolio managers who need policy discipline instead of discretionary drift.</p>
+            <p className="section-note">Select your institution type to see what AAA makes possible for your specific allocation context.</p>
 
             <div className="institutions-grid">
               <div className="surface panel">
@@ -1061,11 +1074,13 @@ export default function MarketingPageClient() {
           </section>
 
           <section id="notes" className="section">
-            <div className="section-title">Research & Decision Notes</div>
-            <p className="section-note">Public reasoning behind deterministic allocation, policy, and system design.</p>
+            <div className="section-title">Research, methodology, and decision design notes</div>
+            <p className="section-lead">The intellectual framework behind Sagitta AAA — why determinism matters, how authority structures work, and what makes allocation policy enforceable.</p>
+            <p className="section-note">These are working notes on the product&apos;s design philosophy. Each note addresses a real question about governance, trust, and institutional capital allocation.</p>
             <div style={{ marginTop: 24, display: "grid", gap: 16 }}>
               {NOTE_REGISTRY.map((noteItem) => {
                 const isActive = noteItem.slug === noteSlug;
+                const summary = NOTE_SUMMARIES[noteItem.slug];
                 return (
                   <button
                     key={noteItem.title}
@@ -1081,10 +1096,13 @@ export default function MarketingPageClient() {
                       borderColor: isActive ? "rgba(var(--sagitta-blue-strong-rgb, 159, 219, 255), 0.4)" : undefined,
                     }}
                   >
+                    <div style={{ fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(255,255,255,0.45)", marginBottom: 6 }}>{noteItem.subtitle}</div>
                     <div style={{ fontSize: 16, fontWeight: 600, color: "#e6edf3", paddingBottom: "8px" }}>{noteItem.title}</div>
-                    <div style={{ fontSize: 13, fontStyle: "italic", color: "rgba(255, 255, 255, 0.6)" }}>{noteItem.subtitle}</div>
-                    <div style={{ marginTop: 8, fontSize: 13, color: "rgba(255,255,255,0.7)", display: "flex", alignItems: "center", gap: 8 }}>
-                      <span>Read -&gt;</span>
+                    {summary && (
+                      <p style={{ fontSize: 13, color: "rgba(255,255,255,0.62)", lineHeight: 1.55, margin: "0 0 10px" }}>{summary}</p>
+                    )}
+                    <div style={{ fontSize: 13, color: "rgba(255,255,255,0.7)", display: "flex", alignItems: "center", gap: 8 }}>
+                      <span>Read note &rarr;</span>
                       {noteItem.audioUrl ? (
                         <span
                           style={{
@@ -1095,13 +1113,21 @@ export default function MarketingPageClient() {
                             borderRadius: 999,
                           }}
                         >
-                          Audio Available
+                          Audio available
                         </span>
                       ) : null}
                     </div>
                   </button>
                 );
               })}
+            </div>
+            <div style={{ marginTop: 20 }}>
+              <a
+                href="/research-notes"
+                style={{ fontSize: 13, color: "var(--sagitta-blue, #63D4FF)", textDecoration: "none" }}
+              >
+                View all research notes &rarr;
+              </a>
             </div>
           </section>
 

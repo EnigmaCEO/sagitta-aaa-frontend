@@ -10,9 +10,9 @@ import {
 export const runtime = "nodejs";
 
 export const metadata: Metadata = {
-  title: "Sagitta AAA — Policy-Driven Allocation Intelligence for Crypto Institutions",
+  title: "Sagitta AAA — AI Crypto Allocation Agent for DAOs and Portfolio Managers",
   description:
-    "Sagitta AAA is a policy-driven, non-custodial allocation and risk engine for DAOs, crypto portfolio managers, and treasury operators. Deterministic, audit-ready allocation decision intelligence.",
+    "Sagitta AAA is a non-custodial allocation and risk engine that turns portfolio policy, governance rules, and market scenarios into deterministic, audit-ready decisions. Built for DAOs, treasury operators, and crypto portfolio managers.",
   alternates: { canonical: "https://aaa.sagitta.systems/" },
 };
 
